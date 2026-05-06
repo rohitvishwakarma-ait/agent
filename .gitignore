@@ -1,0 +1,21 @@
+# Virtual environment — never commit this
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables — contains API keys
+.env
+
+# RAG vector store — large, machine-specific
+rag.store.json
+
+# Generated reports and files from agent
+health_report.md
+report_*.md
+*_fixed.py
+test_*.py
