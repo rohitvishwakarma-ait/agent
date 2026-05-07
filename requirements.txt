@@ -1,9 +1,11 @@
 # Core agent (agent.py)
 langchain-ollama==1.1.0
 langchain-core==1.3.2
-langgraph==1.1.10
 python-dotenv==1.2.2
 requests==2.33.1
+
+# Graph agent (agent_graph.py) — adds approval, retry, validation
+langgraph==1.1.10
 
 # Multi-agent crew (crew.py)
 crewai==1.14.4
