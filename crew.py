@@ -32,12 +32,20 @@ load_dotenv()
 # LLM — CrewAI uses its own LLM wrapper (talks to Ollama via OpenAI-compat API)
 # ============================================================
 
+# Import unified LLM config
+from llm_config import get_llm as get_langchain_llm
+
+# CrewAI uses its own LLM wrapper, so we need to convert
+# For now, keep CrewAI's LLM class but make model configurable
+import os
 llm = LLM(
-    model="ollama/qwen2:7b",
-    base_url="http://localhost:11434",
-    temperature=0,          # deterministic for tool-calling
+    model=f"ollama/{os.getenv('OLLAMA_MODEL', 'qwen2:7b')}",
+    base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+    temperature=0,
     max_tokens=4096,
 )
+# Note: CrewAI doesn't easily support other providers yet
+# Stick with Ollama for crews, or use agent.py/agent_graph.py for other providers
 
 # ============================================================
 # TOOL INPUT SCHEMAS

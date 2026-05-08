@@ -18,11 +18,14 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
-# LangChain imports — notice how clean these are vs TypeScript
-from langchain_ollama import ChatOllama
+# LangChain imports
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
+try:
+    # LangGraph V1 — still works, just deprecated warning
+    from langgraph.prebuilt import create_react_agent
+except ImportError:
+    from langchain.agents import create_react_agent
 
 from rag import RAG
 
@@ -32,18 +35,15 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-OLLAMA_MODEL    = "qwen2:7b"
-EMBEDDING_MODEL = "nomic-embed-text"
 
 # ============================================================
 # LLM — equivalent of new ChatOllama(...)
 # ============================================================
 
-llm = ChatOllama(
-    model=OLLAMA_MODEL,
-    base_url="http://localhost:11434",
-    temperature=0,  # deterministic — important for tool-calling agents
-)
+# Import unified LLM config
+from llm_config import get_llm
+
+llm = get_llm()  # Uses LLM_PROVIDER from .env (defaults to ollama)
 
 # ============================================================
 # TOOLS
@@ -322,8 +322,7 @@ def main():
     chat_history = []
 
     print(f"\n🤖 LangChain Agent (Python)")
-    print(f"🧠 LLM       : {OLLAMA_MODEL}")
-    print(f"📐 Embeddings: {EMBEDDING_MODEL}")
+    print(f"🧠 LLM       : {llm.model if hasattr(llm, 'model') else type(llm).__name__}")
     print(f"🔍 RAG       : {rag.stats()['total']} vectors loaded")
     print(f"\nCommands: /clear  /exit\n")
 

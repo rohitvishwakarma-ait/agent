@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Annotated, TypedDict, Literal
 from dotenv import load_dotenv
 
-from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
@@ -38,14 +37,12 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-OLLAMA_MODEL = "qwen2:7b"
 CHECKPOINT_FILE = "graph_checkpoint.json"
 
-llm = ChatOllama(
-    model=OLLAMA_MODEL,
-    base_url="http://localhost:11434",
-    temperature=0,
-)
+# Import unified LLM config
+from llm_config import get_llm
+
+llm = get_llm()  # Uses LLM_PROVIDER from .env (defaults to ollama)
 
 rag = RAG("rag.store.json")
 
@@ -382,7 +379,7 @@ def main():
     enable_checkpoints = "--no-checkpoints" not in flags
     
     print(f"\n🤖 LangGraph Agent")
-    print(f"🧠 LLM: {OLLAMA_MODEL}")
+    print(f"🧠 LLM: {llm.model if hasattr(llm, 'model') else type(llm).__name__}")
     print(f"🔐 Approval: {'enabled' if enable_approval else 'disabled'}")
     print(f"💾 Checkpoints: {'enabled' if enable_checkpoints else 'disabled'}")
     print()
