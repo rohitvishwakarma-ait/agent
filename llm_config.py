@@ -185,13 +185,16 @@ def _get_cloudflare_llm(config):
         if model.startswith("workers-ai/"):
             model = model[len("workers-ai/"):]
 
-        return ChatOpenAI(
+        llm = ChatOpenAI(
             model=model,
             api_key=aig_token,
             base_url=base_url,
             temperature=config["temperature"],
             default_headers={"cf-aig-authorization": f"Bearer {aig_token}"},
         )
+        # Tag the instance so agent.py knows to use text-mode tool calling
+        llm._cf_text_tools = True
+        return llm
 
     # ── Mode 2: Direct Workers AI API ───────────────────────────────────────
     if not api_token:

@@ -59,9 +59,18 @@ llm = get_llm()  # Uses LLM_PROVIDER from .env (defaults to ollama)
 
 @tool
 def run_shell(command: str) -> str:
-    """Run a shell command on the local machine. Use for: checking running processes,
-    finding ports, disk usage, current date/time, system info.
-    Input must be a safe, read-only shell command."""
+    """Run a shell command on the local machine.
+
+    Use for: checking running processes, finding ports, disk usage,
+    current date/time, system info.
+    Input must be a safe, read-only shell command.
+
+    Args:
+        command (str): The shell command to execute.
+
+    Returns:
+        str: stdout/stderr output, or an error message on failure.
+    """
     try:
         result = subprocess.run(
             command,
@@ -79,6 +88,9 @@ def run_shell(command: str) -> str:
 
 @tool
 def read_file(path: str) -> str:
+    """Read the contents of a file from disk. Use when the user asks about
+    a specific file's contents, config files, or code files. This function takes a file path as input and returns the file contents as a string."""
+
     """Read the contents of a file from disk. Use when the user asks about
     a specific file's contents, config files, or code files."""
     try:
@@ -448,7 +460,17 @@ WHEN TO USE TOOLS vs MEMORY:
 - Use tools for anything requiring real-time or system data
 - Answer from memory for personal facts the user told you (name, preferences, projects)"""
 
-agent = create_react_agent(llm, tools, prompt=SystemMessage(SYSTEM_PROMPT))
+# Detect if provider needs text-mode tool calling (Cloudflare Workers AI)
+# Cloudflare doesn't support OpenAI-style tool schemas — use plain text instead
+USE_TEXT_TOOLS = getattr(llm, "_cf_text_tools", False)
+
+if USE_TEXT_TOOLS:
+    # Cloudflare mode: no tool binding — agent gets tools described in text,
+    # executes them by parsing the response manually
+    print("⚡ Cloudflare mode: using text-based tool calling")
+    agent = None  # will use cf_run_task() instead
+else:
+    agent = create_react_agent(llm, tools, prompt=SystemMessage(SYSTEM_PROMPT))
 
 # ============================================================
 # RAG
@@ -465,6 +487,102 @@ ACTION_PATTERN = re.compile(
     r"install|deploy|test|debug|analyse|analyze|review|improve|optimize)",
     re.IGNORECASE,
 )
+
+# Tool name → function map for text-mode execution
+TOOL_MAP = {t.name: t for t in tools}
+
+
+# ============================================================
+# CLOUDFLARE TEXT-MODE RUNNER
+# Cloudflare Workers AI doesn't support OpenAI tool schemas.
+# Instead: describe tools in the prompt, parse TOOL_CALL: blocks from response,
+# execute them directly, feed results back, get final answer.
+# ============================================================
+
+def cf_run_task(task: str, preflight_context: str = "") -> tuple[str, bool]:
+    """Run a task using Cloudflare with text-based tool calling."""
+
+    tools_desc = "\n".join([
+        f"- {t.name}: {t.description.splitlines()[0]}"
+        for t in tools
+    ])
+
+    system = (
+        "You are an expert coding agent. You have access to these tools:\n\n"
+        f"{tools_desc}\n\n"
+        "To use a tool, respond with EXACTLY this format (nothing else on that line):\n"
+        "TOOL_CALL: tool_name\n"
+        "INPUT: {\"param\": \"value\"}\n\n"
+        "After getting the tool result, you can call another tool or give your final answer.\n"
+        "When done, start your response with FINAL_ANSWER:\n\n"
+        f"{preflight_context}"
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": task},
+    ]
+
+    used_tools = False
+    final_answer = ""
+    max_turns = 6
+
+    for turn in range(max_turns):
+        response = llm.invoke(messages)
+        text = response.content.strip()
+
+        # Check for tool call
+        if "TOOL_CALL:" in text:
+            lines = text.splitlines()
+            tool_name = ""
+            tool_input = {}
+
+            for i, line in enumerate(lines):
+                if line.startswith("TOOL_CALL:"):
+                    tool_name = line.replace("TOOL_CALL:", "").strip()
+                if line.startswith("INPUT:"):
+                    try:
+                        tool_input = json.loads(line.replace("INPUT:", "").strip())
+                    except Exception:
+                        tool_input = {}
+
+            if tool_name in TOOL_MAP:
+                print(f"\n⚙️  [{tool_name}] running...\n🤖 Agent Working... ", end="", flush=True)
+                try:
+                    result = TOOL_MAP[tool_name].invoke(tool_input)
+                except Exception as e:
+                    result = f"ERROR: {e}"
+                used_tools = True
+
+                # Feed result back
+                messages.append({"role": "assistant", "content": text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Tool result:\n{result}\n\n"
+                        f"If the task is complete, respond with FINAL_ANSWER: <your summary>. "
+                        f"If you need to do more, call the next tool."
+                    )
+                })
+
+                # Auto-stop if edit_file succeeded — task is done
+                if tool_name == "edit_file" and result.startswith("✅"):
+                    final_answer = f"Done. {result}"
+                    break
+            else:
+                # Unknown tool — treat as final answer
+                final_answer = text
+                break
+
+        elif "FINAL_ANSWER:" in text:
+            final_answer = text.replace("FINAL_ANSWER:", "").strip()
+            break
+        else:
+            # No tool call and no FINAL_ANSWER marker — treat whole response as answer
+            final_answer = text
+            break
+
+    return final_answer or text, used_tools
 
 # ============================================================
 # RUN ONE TASK — equivalent of runTask()
@@ -499,15 +617,34 @@ def run_task(
 
     # For coding tasks, prepend a strong instruction to use tools
     coding_instruction = ""
+    preflight_context = ""
     if is_coding_task:
+        # ── Pre-flight: extract filename from task and read it automatically ──
+        # This bypasses qwen2:7b's tendency to answer from memory by putting
+        # the actual file content directly into the prompt context.
+        file_match = re.search(r"([\w./\\-]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|json|yaml|yml|toml))", task)
+        if file_match:
+            target_file = file_match.group(1)
+            try:
+                file_content = Path(target_file).read_text(encoding="utf-8")
+                preflight_context = (
+                    f"\n\n--- CURRENT CONTENT OF {target_file} ---\n"
+                    f"{file_content}\n"
+                    f"--- END OF {target_file} ---\n"
+                )
+                print(f"\n📂 Pre-loaded: {target_file} ({len(file_content)} chars)")
+            except Exception:
+                pass  # file not found — agent will handle it
+
         coding_instruction = (
-            "\n\nIMPORTANT: This is a coding task. You MUST use tools — do NOT answer from memory.\n"
-            "Required steps:\n"
-            "  1. Call read_file to read the target file first\n"
-            "  2. Call edit_file to make the change surgically\n"
-            "  3. Confirm what was changed\n"
-            "Never show code in chat without actually writing it to the file."
+            f"\n\nIMPORTANT: This is a coding task. The file content is shown above."
+            f"\nYou MUST call edit_file to make the actual change — do NOT just show code."
+            f"\nUse the EXACT text from the file content above as old_str in edit_file."
         )
+
+    # ── Cloudflare text-mode routing ──
+    if USE_TEXT_TOOLS:
+        return cf_run_task(task, preflight_context + coding_instruction)
 
     system_with_rag = SystemMessage(
         f"""You are an expert coding agent with Claude Code-like capabilities.
@@ -537,7 +674,7 @@ CRITICAL RULES:
 - For RUN/CHECK/LIST/FIND on the system → use run_shell or list_directory
 - For SEARCH the web → use web_search
 - Only answer from memory for personal facts — never for action tasks.
-{rag_context}{coding_instruction}"""
+{rag_context}{preflight_context}{coding_instruction}"""
     )
 
     messages = [system_with_rag] + chat_history[-4:] + [HumanMessage(task)]
