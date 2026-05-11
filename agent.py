@@ -460,7 +460,9 @@ rag = RAG("rag.store.json")
 # (RAG causes model to answer from memory instead of acting)
 ACTION_PATTERN = re.compile(
     r"^(create|make|write|save|generate|build|delete|remove|run|execute|"
-    r"show me|list|find|search|check|get|fetch|call|send|open|read)",
+    r"show me|list|find|search|check|get|fetch|call|send|open|read|"
+    r"add|edit|fix|update|change|modify|refactor|rename|move|index|"
+    r"install|deploy|test|debug|analyse|analyze|review|improve|optimize)",
     re.IGNORECASE,
 )
 
@@ -478,13 +480,34 @@ def run_task(
     """
     is_action_task = bool(ACTION_PATTERN.match(task.strip()))
 
-    # Build RAG context for recall questions only
+    # Detect coding/file tasks — these must NEVER use RAG, always use tools
+    CODING_PATTERN = re.compile(
+        r"(\.py|\.js|\.ts|\.go|\.java|\.cpp|\.c|\.h|\.json|\.yaml|\.yml|\.toml|"
+        r"function|class|method|docstring|import|variable|bug|error|fix|refactor|"
+        r"edit|modify|change|update|add to|add a|in agent|in crew|in the file)",
+        re.IGNORECASE,
+    )
+    is_coding_task = bool(CODING_PATTERN.search(task))
+
+    # Build RAG context for recall questions only — never for action/coding tasks
     rag_context = ""
-    if not is_action_task:
+    if not is_action_task and not is_coding_task:
         relevant = rag.search(task, top_k=5)
         if relevant:
             lines = [f"[{e.role}]: {e.text}" for e in relevant]
             rag_context = "\n\nRelevant memories from past conversations:\n" + "\n".join(lines)
+
+    # For coding tasks, prepend a strong instruction to use tools
+    coding_instruction = ""
+    if is_coding_task:
+        coding_instruction = (
+            "\n\nIMPORTANT: This is a coding task. You MUST use tools — do NOT answer from memory.\n"
+            "Required steps:\n"
+            "  1. Call read_file to read the target file first\n"
+            "  2. Call edit_file to make the change surgically\n"
+            "  3. Confirm what was changed\n"
+            "Never show code in chat without actually writing it to the file."
+        )
 
     system_with_rag = SystemMessage(
         f"""You are an expert coding agent with Claude Code-like capabilities.
@@ -502,19 +525,19 @@ AVAILABLE TOOLS:
 - preview_diff   : show what a file change would look like before applying it
 
 CODING WORKFLOW:
-1. index_codebase → understand project structure
-2. read_file      → read the file you need to change
-3. edit_file      → make surgical changes (ALWAYS prefer over write_file for edits)
-4. write_file     → only for brand new files
+1. read_file      → read the file you need to change
+2. edit_file      → make surgical changes (ALWAYS prefer over write_file for edits)
+3. write_file     → only for brand new files
 
 CRITICAL RULES:
+- NEVER answer a coding task from memory — always use read_file then edit_file
 - NEVER rewrite an entire file to change a few lines — use edit_file
 - old_str in edit_file must match the file EXACTLY (copy from read_file output)
 - For CREATE/WRITE/SAVE/GENERATE a new file → use write_file
 - For RUN/CHECK/LIST/FIND on the system → use run_shell or list_directory
 - For SEARCH the web → use web_search
 - Only answer from memory for personal facts — never for action tasks.
-{rag_context}"""
+{rag_context}{coding_instruction}"""
     )
 
     messages = [system_with_rag] + chat_history[-4:] + [HumanMessage(task)]
