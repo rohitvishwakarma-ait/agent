@@ -1,6 +1,9 @@
 """
-agent.py — LangChain agent with RAG, streaming, and 7 tools
-Python equivalent of agent.langchain.ts
+agent.py — LangChain agent with RAG, streaming, and 10 tools
+Includes Phase 1 Claude Code-like capabilities:
+  - index_codebase : scan project structure + extract symbols
+  - edit_file      : surgical str_replace edits (no full rewrites)
+  - preview_diff   : show unified diff before applying changes
 
 Run:
   python agent.py "your task here"   # single-shot mode
@@ -11,6 +14,8 @@ Run:
 import os
 import sys
 import json
+import ast
+import difflib
 import subprocess
 import re
 import requests
@@ -204,28 +209,244 @@ def git_tool(command: str) -> str:
         return f"ERROR: {e}"
 
 
-tools = [run_shell, read_file, write_file, list_directory, web_search, http_request, git_tool]
+# ============================================================
+# PHASE 1 — CLAUDE CODE-LIKE TOOLS
+# ============================================================
+
+@tool
+def index_codebase(path: str = ".") -> str:
+    """Scan the project and return a structured map of all source files,
+    their classes, functions, and imports. Call this FIRST before any
+    coding task so you understand the full project structure.
+    Use '.' for the current project directory."""
+    try:
+        root = Path(path).resolve()
+
+        # File extensions to index
+        CODE_EXTS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".cpp", ".c", ".h"}
+        SKIP_DIRS = {"venv", ".venv", "node_modules", "__pycache__", ".git", "dist", "build", ".mypy_cache"}
+
+        lines = [f"📁 Project: {root.name}", f"📍 Path: {root}\n"]
+        total_files = 0
+
+        for file_path in sorted(root.rglob("*")):
+            # Skip hidden dirs and common noise dirs
+            if any(part in SKIP_DIRS for part in file_path.parts):
+                continue
+            if not file_path.is_file():
+                continue
+            if file_path.suffix not in CODE_EXTS:
+                continue
+
+            rel = file_path.relative_to(root)
+            total_files += 1
+            size_kb = file_path.stat().st_size / 1024
+            lines.append(f"📄 {rel}  ({size_kb:.1f} KB)")
+
+            # Deep-index Python files — extract symbols via AST
+            if file_path.suffix == ".py":
+                try:
+                    source = file_path.read_text(encoding="utf-8", errors="ignore")
+                    tree = ast.parse(source)
+
+                    imports = []
+                    classes = []
+                    functions = []
+
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                imports.append(alias.name.split(".")[0])
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module:
+                                imports.append(node.module.split(".")[0])
+                        elif isinstance(node, ast.ClassDef):
+                            methods = [
+                                n.name for n in ast.walk(node)
+                                if isinstance(n, ast.FunctionDef) and n.col_offset > node.col_offset
+                            ]
+                            classes.append(f"{node.name}({', '.join(methods[:5])}{'...' if len(methods) > 5 else ''})")
+                        elif isinstance(node, ast.FunctionDef) and node.col_offset == 0:
+                            # Top-level functions only
+                            args = [a.arg for a in node.args.args]
+                            functions.append(f"{node.name}({', '.join(args[:4])}{'...' if len(args) > 4 else ''})")
+
+                    # Deduplicate imports, show top ones
+                    unique_imports = list(dict.fromkeys(imports))[:8]
+                    if unique_imports:
+                        lines.append(f"   imports : {', '.join(unique_imports)}")
+                    if classes:
+                        lines.append(f"   classes : {', '.join(classes[:5])}")
+                    if functions:
+                        lines.append(f"   funcs   : {', '.join(functions[:8])}")
+
+                except SyntaxError:
+                    lines.append(f"   (syntax error — could not parse)")
+                except Exception:
+                    pass
+
+            lines.append("")  # blank line between files
+
+        lines.append(f"─── Total: {total_files} source files indexed ───")
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@tool
+def edit_file(path: str, old_str: str, new_str: str) -> str:
+    """Make a surgical edit to a file by replacing an exact string.
+    Safer than write_file — only changes the specific part you target.
+    Use this for: fixing bugs, updating functions, changing config values,
+    refactoring specific lines. old_str must match the file content EXACTLY
+    (including indentation and whitespace).
+    Returns a diff of what changed."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            return f"ERROR: File not found: {path}"
+
+        original = p.read_text(encoding="utf-8")
+
+        if old_str not in original:
+            # Help the LLM debug — show nearby content
+            lines = original.splitlines()
+            # Try to find the closest matching line
+            first_line = old_str.strip().splitlines()[0].strip() if old_str.strip() else ""
+            matches = [
+                f"  line {i+1}: {l}"
+                for i, l in enumerate(lines)
+                if first_line and first_line[:20].lower() in l.lower()
+            ]
+            hint = "\nClosest matches:\n" + "\n".join(matches[:3]) if matches else ""
+            return (
+                f"ERROR: old_str not found in {path}.\n"
+                f"Make sure indentation and whitespace match exactly.{hint}"
+            )
+
+        # Count occurrences — warn if ambiguous
+        count = original.count(old_str)
+        if count > 1:
+            return (
+                f"ERROR: old_str appears {count} times in {path}. "
+                f"Make it more specific so it matches exactly once."
+            )
+
+        updated = original.replace(old_str, new_str, 1)
+
+        # Generate diff for confirmation
+        diff = list(difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        ))
+
+        p.write_text(updated, encoding="utf-8")
+
+        diff_str = "".join(diff[:40])  # cap at 40 lines for readability
+        if len(diff) > 40:
+            diff_str += f"\n... ({len(diff) - 40} more lines)"
+
+        return f"✅ Edited {path}\n\n{diff_str}"
+
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@tool
+def preview_diff(path: str, new_content: str) -> str:
+    """Preview what a full file rewrite would change, WITHOUT applying it.
+    Use this before write_file when you want to show the user what will
+    change and get confirmation. Shows a unified diff format."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            # New file — show it as all additions
+            new_lines = new_content.splitlines(keepends=True)
+            diff = difflib.unified_diff(
+                [],
+                new_lines,
+                fromfile="/dev/null",
+                tofile=f"b/{path}",
+                lineterm="",
+            )
+            result = "".join(diff)
+            return f"📄 New file: {path}\n\n{result}" if result else "(empty file)"
+
+        original = p.read_text(encoding="utf-8")
+        diff = list(difflib.unified_diff(
+            original.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        ))
+
+        if not diff:
+            return f"✅ No changes — new content is identical to {path}"
+
+        diff_str = "".join(diff[:60])
+        if len(diff) > 60:
+            diff_str += f"\n... ({len(diff) - 60} more lines not shown)"
+
+        added   = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+
+        return (
+            f"📊 Diff for {path}: +{added} lines, -{removed} lines\n\n"
+            f"{diff_str}\n\n"
+            f"⚠️  This is a PREVIEW only. Use write_file to apply."
+        )
+
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+tools = [
+    run_shell, read_file, write_file, list_directory,
+    web_search, http_request, git_tool,
+    # Phase 1 — Claude Code-like tools
+    index_codebase, edit_file, preview_diff,
+]
 
 # ============================================================
 # AGENT — equivalent of createReactAgent(...)
 # ============================================================
 
-SYSTEM_PROMPT = """You are a helpful AI agent with memory of past conversations.
+SYSTEM_PROMPT = """You are an expert coding agent with Claude Code-like capabilities.
 
 AVAILABLE TOOLS:
 - run_shell      : run shell commands (processes, ports, disk, date, system info)
 - read_file      : read a file from disk
-- write_file     : create or overwrite a file on disk
+- write_file     : create or overwrite a WHOLE file (use for new files only)
 - list_directory : list files in a folder
 - web_search     : search the web for current information
 - http_request   : call any REST API or URL
 - git_tool       : inspect git repo (log, status, diff, branches)
+- index_codebase : scan entire project — extract all files, classes, functions
+- edit_file      : surgically replace exact text in a file (PREFERRED for edits)
+- preview_diff   : show what a file change would look like before applying it
+
+CODING WORKFLOW (follow this order):
+1. index_codebase — understand the project structure first
+2. read_file      — read the specific file(s) you need to change
+3. preview_diff   — show the user what will change (for large edits)
+4. edit_file      — make surgical changes (ALWAYS prefer over write_file for edits)
+5. write_file     — only for creating brand new files
+
+RULES:
+- NEVER rewrite an entire file just to change a few lines — use edit_file
+- ALWAYS read a file before editing it
+- For coding tasks, call index_codebase first to understand the project
+- old_str in edit_file must match the file EXACTLY (copy-paste from read_file output)
+- Use preview_diff before write_file on large files so user can review
 
 WHEN TO USE TOOLS vs MEMORY:
 - Use tools for anything requiring real-time or system data
-- Answer from memory for personal facts the user told you (name, preferences, projects)
-
-Always give a clear, direct answer after using tools."""
+- Answer from memory for personal facts the user told you (name, preferences, projects)"""
 
 agent = create_react_agent(llm, tools, prompt=SystemMessage(SYSTEM_PROMPT))
 
@@ -266,22 +487,33 @@ def run_task(
             rag_context = "\n\nRelevant memories from past conversations:\n" + "\n".join(lines)
 
     system_with_rag = SystemMessage(
-        f"""You are a helpful AI agent with memory of past conversations.
+        f"""You are an expert coding agent with Claude Code-like capabilities.
 
 AVAILABLE TOOLS:
 - run_shell      : run shell commands (processes, ports, disk, date, system info)
 - read_file      : read a file from disk
-- write_file     : create or overwrite a file on disk
+- write_file     : create or overwrite a WHOLE file (new files only)
 - list_directory : list files in a folder
 - web_search     : search the web for current information
 - http_request   : call any REST API or URL
 - git_tool       : inspect git repo (log, status, diff, branches)
+- index_codebase : scan entire project — extract all files, classes, functions
+- edit_file      : surgically replace exact text in a file (PREFERRED for edits)
+- preview_diff   : show what a file change would look like before applying it
+
+CODING WORKFLOW:
+1. index_codebase → understand project structure
+2. read_file      → read the file you need to change
+3. edit_file      → make surgical changes (ALWAYS prefer over write_file for edits)
+4. write_file     → only for brand new files
 
 CRITICAL RULES:
-- If the task asks to CREATE, WRITE, SAVE, or GENERATE a file → always use write_file. Never just show the code.
-- If the task asks to RUN, CHECK, LIST, or FIND something on the system → always use run_shell or list_directory.
-- If the task asks to SEARCH the web → always use web_search.
-- Only answer from memory for personal facts (name, preferences) — never for action tasks.
+- NEVER rewrite an entire file to change a few lines — use edit_file
+- old_str in edit_file must match the file EXACTLY (copy from read_file output)
+- For CREATE/WRITE/SAVE/GENERATE a new file → use write_file
+- For RUN/CHECK/LIST/FIND on the system → use run_shell or list_directory
+- For SEARCH the web → use web_search
+- Only answer from memory for personal facts — never for action tasks.
 {rag_context}"""
     )
 
