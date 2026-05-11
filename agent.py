@@ -499,7 +499,7 @@ TOOL_MAP = {t.name: t for t in tools}
 # execute them directly, feed results back, get final answer.
 # ============================================================
 
-def cf_run_task(task: str, preflight_context: str = "") -> tuple[str, bool]:
+def cf_run_task(task: str, preflight_context: str = "", rag_context: str = "") -> tuple[str, bool]:
     """Run a task using Cloudflare with text-based tool calling."""
 
     tools_desc = "\n".join([
@@ -508,13 +508,20 @@ def cf_run_task(task: str, preflight_context: str = "") -> tuple[str, bool]:
     ])
 
     system = (
-        "You are an expert coding agent. You have access to these tools:\n\n"
+        "You are an expert coding agent with memory of past conversations. "
+        "You have access to these tools:\n\n"
         f"{tools_desc}\n\n"
         "To use a tool, respond with EXACTLY this format (nothing else on that line):\n"
         "TOOL_CALL: tool_name\n"
         "INPUT: {\"param\": \"value\"}\n\n"
-        "After getting the tool result, you can call another tool or give your final answer.\n"
-        "When done, start your response with FINAL_ANSWER:\n\n"
+        "WORKFLOW for coding tasks:\n"
+        "  1. Call read_file to read the target file first\n"
+        "  2. Call edit_file with old_str copied EXACTLY from the file\n"
+        "  3. Respond with FINAL_ANSWER: <summary of what was done>\n\n"
+        "For recall questions (name, preferences, past facts), answer from memory below.\n"
+        "For action tasks (run, check, edit, create), use tools.\n"
+        "After getting a tool result, either call the next tool or give FINAL_ANSWER.\n"
+        f"{rag_context}"
         f"{preflight_context}"
     )
 
@@ -526,6 +533,8 @@ def cf_run_task(task: str, preflight_context: str = "") -> tuple[str, bool]:
     used_tools = False
     final_answer = ""
     max_turns = 6
+
+    print("\n🤖 Agent Working... ", end="", flush=True)
 
     for turn in range(max_turns):
         response = llm.invoke(messages)
@@ -582,6 +591,10 @@ def cf_run_task(task: str, preflight_context: str = "") -> tuple[str, bool]:
             final_answer = text
             break
 
+    # Print the final answer to terminal (equivalent of Ollama's streaming print)
+    print(final_answer)
+    print()  # newline
+
     return final_answer or text, used_tools
 
 # ============================================================
@@ -619,32 +632,41 @@ def run_task(
     coding_instruction = ""
     preflight_context = ""
     if is_coding_task:
-        # ── Pre-flight: extract filename from task and read it automatically ──
-        # This bypasses qwen2:7b's tendency to answer from memory by putting
-        # the actual file content directly into the prompt context.
-        file_match = re.search(r"([\w./\\-]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|json|yaml|yml|toml))", task)
-        if file_match:
-            target_file = file_match.group(1)
-            try:
-                file_content = Path(target_file).read_text(encoding="utf-8")
-                preflight_context = (
-                    f"\n\n--- CURRENT CONTENT OF {target_file} ---\n"
-                    f"{file_content}\n"
-                    f"--- END OF {target_file} ---\n"
-                )
-                print(f"\n📂 Pre-loaded: {target_file} ({len(file_content)} chars)")
-            except Exception:
-                pass  # file not found — agent will handle it
+        if USE_TEXT_TOOLS:
+            # Cloudflare — capable model, no file pre-loading needed
+            coding_instruction = (
+                "\n\nIMPORTANT: This is a coding task. You MUST use tools.\n"
+                "Steps: 1) call read_file to read the target file, "
+                "2) call edit_file with old_str copied EXACTLY from the file content, "
+                "3) respond with FINAL_ANSWER."
+            )
+        else:
+            # Ollama — small model needs file content pre-loaded into prompt
+            file_match = re.search(r"([\w./\\-]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|json|yaml|yml|toml))", task)
+            if file_match:
+                target_file = file_match.group(1)
+                try:
+                    file_content = Path(target_file).read_text(encoding="utf-8")
+                    preflight_context = (
+                        f"\n\n--- CURRENT CONTENT OF {target_file} ---\n"
+                        f"{file_content}\n"
+                        f"--- END OF {target_file} ---\n"
+                    )
+                    print(f"\n📂 Pre-loaded: {target_file} ({len(file_content)} chars)")
+                except Exception:
+                    pass  # file not found — agent will handle it
 
-        coding_instruction = (
-            f"\n\nIMPORTANT: This is a coding task. The file content is shown above."
-            f"\nYou MUST call edit_file to make the actual change — do NOT just show code."
-            f"\nUse the EXACT text from the file content above as old_str in edit_file."
-        )
+            coding_instruction = (
+                "\n\nIMPORTANT: This is a coding task. The file content is shown above."
+                "\nYou MUST call edit_file to make the actual change — do NOT just show code."
+                "\nUse the EXACT text from the file content above as old_str in edit_file."
+            )
 
     # ── Cloudflare text-mode routing ──
+    # Cloudflare's 70B model is capable enough to call read_file itself —
+    # no need to pre-load file content (saves tokens, avoids context limits)
     if USE_TEXT_TOOLS:
-        return cf_run_task(task, preflight_context + coding_instruction)
+        return cf_run_task(task, coding_instruction, rag_context)
 
     system_with_rag = SystemMessage(
         f"""You are an expert coding agent with Claude Code-like capabilities.

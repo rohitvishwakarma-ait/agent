@@ -92,6 +92,27 @@ class RAG:
         if type_ == "system":
             return
 
+        # Deduplicate — skip if identical text already exists
+        text_lower = text.strip().lower()
+        for entry in self.entries:
+            if entry.text.strip().lower() == text_lower:
+                return  # already stored, skip
+
+        # For user messages: only store factual statements, not questions
+        # Questions like "do you know my name?" pollute search results
+        # because they match future questions better than actual facts
+        if role == "user":
+            text_stripped = text.strip()
+            # Skip if it's a question (ends with ? or starts with question words)
+            is_question = (
+                text_stripped.endswith("?") or
+                text_stripped.lower().startswith(("what", "who", "where", "when",
+                                                   "why", "how", "do you", "can you",
+                                                   "did you", "is ", "are ", "tell me"))
+            )
+            if is_question:
+                return  # don't store questions — only store facts
+
         vector = self.embed(text)
         random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
 
