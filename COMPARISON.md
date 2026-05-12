@@ -1,12 +1,12 @@
-# Agent Comparison: agent.py vs crew.py vs agent_graph.py
+# Agent Comparison
 
 ## Quick Reference
 
 | File | Purpose | Best For |
 |---|---|---|
-| `agent.py` | Single agent, simple tasks | Quick queries, system checks |
-| `crew.py` | Multi-agent teams | Complex multi-step tasks |
-| `agent_graph.py` | Single agent with advanced control | Tasks needing approval/retry/validation |
+| `agent.py` | Single agent, 12 tools, streaming | Quick queries, coding, system checks |
+| `crew.py` | Multi-agent teams, 3 crews | Complex multi-step tasks with specialists |
+| `agent_graph.py` | Graph workflow, approval, test loop | Coding tasks, sensitive ops, verification |
 
 ---
 
@@ -14,163 +14,92 @@
 
 | Feature | agent.py | crew.py | agent_graph.py |
 |---|---|---|---|
-| **Execution Model** | Single agent | 3 specialized agents per crew | Single agent with graph workflow |
-| **Tools** | 7 tools | Same 7 tools | Same 7 tools |
-| **Memory** | RAG (rag.store.json) | RAG + optional CrewAI memory | RAG (rag.store.json) |
-| **Streaming** | ✅ Yes | ✅ Yes | ❌ No (graph-based) |
-| **Human Approval** | ❌ No | ❌ No | ✅ Yes (for file writes) |
-| **Retry Logic** | ❌ No | ❌ No | ✅ Yes (automatic, up to 2x) |
-| **Conditional Branching** | ❌ No | ⚠️ Sequential only | ✅ Yes (dynamic routing) |
-| **Validation Loop** | ❌ No | ❌ No | ✅ Yes (iterative refinement) |
-| **Checkpointing** | ❌ No | ❌ No | ✅ Yes (resume after restart) |
-| **Complexity** | Low | Medium | High |
-| **Speed** | Fast | Slow (3 LLM calls) | Medium |
+| **Tools** | 12 | 7 | 7 |
+| **Streaming** | ✅ (Ollama) / simulated (CF) | ✅ | ❌ |
+| **Human approval** | ❌ | ❌ | ✅ |
+| **Error recovery** | ✅ retry + backoff | ❌ | ✅ retry |
+| **Test → fix loop** | ❌ | ❌ | ✅ |
+| **Multi-file planning** | ❌ | ❌ | ✅ `--plan` |
+| **Git writes** | ❌ | ❌ | ✅ with approval |
+| **Validation loop** | ❌ | ❌ | ✅ |
+| **Checkpointing** | ❌ | ❌ | ✅ |
+| **Multi-agent** | ❌ | ✅ 9 specialists | ❌ |
+| **RAG memory** | ✅ | ❌ | ❌ |
+| **Session memory** | ✅ session.json | ❌ | ❌ |
+| **Token tracking** | ✅ | ❌ | ❌ |
+| **Project context** | ✅ auto-loads README | ❌ | ❌ |
+| **Cloudflare support** | ✅ | ✅ | ✅ |
+| **Speed** | ⚡ Fast | 🐌 Slow | ⚡ Medium |
 
 ---
 
 ## Use Case Examples
 
-### Example 1: "Check disk usage"
-
-**agent.py:**
+### "Check disk usage"
 ```bash
-python agent.py "check disk usage"
-# ✅ Fast, simple, one LLM call
-# ⚠️  No retry if command fails
+python agent.py "check disk usage"          # ✅ Best — fast, simple
+python agent_graph.py "check disk usage" --no-tests --no-approval  # works too
+python crew.py devops "check disk usage"    # ⚠️ overkill
 ```
-
-**crew.py:**
-```bash
-python crew.py devops "check disk usage"
-# ⚠️  Overkill — uses 3 agents for a simple task
-# ⚠️  Slow — 3 separate LLM calls
-```
-
-**agent_graph.py:**
-```bash
-python agent_graph.py "check disk usage" --no-approval
-# ✅ Automatic retry if command fails
-# ⚠️  Slightly slower due to graph overhead
-```
-
-**Winner:** `agent.py` — simplest and fastest for this task.
+**Winner:** `agent.py`
 
 ---
 
-### Example 2: "Create a config.json file"
-
-**agent.py:**
+### "Add a docstring to the run_task function in agent.py"
 ```bash
-python agent.py "create a config.json file"
-# ⚠️  Writes immediately, no preview
-# ⚠️  If agent misunderstands, wrong content is on disk
-```
+python agent.py "add a docstring to run_task in agent.py"
+# ✅ Uses extract_symbol → edit_file workflow
+# ✅ Token-efficient (extracts only the function, not whole file)
 
-**crew.py:**
-```bash
-python crew.py code "create a config.json file"
-# ⚠️  Overkill — reviewer, fixer, tester for one file
-# ⚠️  No approval step
+python agent_graph.py "add docstring to run_task in agent.py" --plan
+# ✅ Shows plan first, then edits, then runs tests
 ```
-
-**agent_graph.py:**
-```bash
-python agent_graph.py "create a config.json file"
-# ✅ Shows preview before writing
-# ✅ You approve/reject
-# ✅ Safe
-```
-
-**Winner:** `agent_graph.py` — only one with human approval.
+**Winner:** `agent_graph.py --plan` for safety, `agent.py` for speed
 
 ---
 
-### Example 3: "Review agent.py, fix bugs, write tests"
-
-**agent.py:**
+### "Review agent.py, fix bugs, write tests"
 ```bash
-python agent.py "review agent.py, fix bugs, write tests"
-# ⚠️  Single agent tries to do 3 different jobs
-# ⚠️  Gets confused juggling multiple concerns
-# ⚠️  Output is messy
-```
-
-**crew.py:**
-```bash
-python crew.py code "review agent.py"
-# ✅ Reviewer finds bugs
-# ✅ Fixer fixes them
-# ✅ Tester writes tests
+python crew.py code "review agent.py and fix bugs"
+# ✅ Reviewer → Fixer → Tester pipeline
 # ✅ Each agent focused on one job
-# ✅ Structured output
-```
 
-**agent_graph.py:**
-```bash
-python agent_graph.py "review agent.py, fix bugs, write tests"
-# ⚠️  Single agent, same confusion as agent.py
-# ✅ But has approval for file writes
-# ✅ And retry if tools fail
+python agent_graph.py "review agent.py" --plan
+# ✅ Plans first, edits surgically, runs tests automatically
 ```
-
-**Winner:** `crew.py` — designed for multi-step tasks with specialists.
+**Winner:** `crew.py` for structured review, `agent_graph.py` for automated test verification
 
 ---
 
-### Example 4: "Research Python 3.13 and write a report"
-
-**agent.py:**
-```bash
-python agent.py "research Python 3.13 and write a report"
-# ⚠️  Returns raw search results
-# ⚠️  No analysis or structure
-```
-
-**crew.py:**
+### "Research Python 3.13 and write a report"
 ```bash
 python crew.py research "Python 3.13 new features"
-# ✅ Researcher gathers info
-# ✅ Analyst structures it
-# ✅ Writer produces clean markdown report
-# ✅ Saved to disk automatically
+# ✅ Researcher → Analyst → Writer pipeline
+# ✅ Structured markdown report saved to disk
 ```
-
-**agent_graph.py:**
-```bash
-python agent_graph.py "research Python 3.13 and write a report"
-# ⚠️  Single agent, same as agent.py
-# ✅ But has approval before writing report
-```
-
-**Winner:** `crew.py` — research crew is purpose-built for this.
+**Winner:** `crew.py research`
 
 ---
 
-### Example 5: "curl https://api.example.com (might fail)"
-
-**agent.py:**
+### "Fix the failing test in rag.py"
 ```bash
-python agent.py "curl https://api.example.com"
-# ⚠️  If it fails, just returns error
-# ⚠️  No retry
+python agent_graph.py "fix the failing test in rag.py" --plan
+# ✅ Shows plan before touching files
+# ✅ Edits file surgically
+# ✅ Runs pytest automatically after edit
+# ✅ If tests still fail, loops back to fix again (up to 3 attempts)
 ```
+**Winner:** `agent_graph.py`
 
-**crew.py:**
+---
+
+### "Fetch the LangChain docs and summarize tool calling"
 ```bash
-python crew.py devops "curl https://api.example.com"
-# ⚠️  No retry logic
-# ⚠️  Overkill for one command
+python agent.py "fetch https://python.langchain.com/docs/concepts/tools/ and summarize tool calling"
+# ✅ Uses fetch_url tool to get full page content
+# ✅ Summarizes and answers
 ```
-
-**agent_graph.py:**
-```bash
-python agent_graph.py "curl https://api.example.com" --no-approval
-# ✅ If it fails, automatically retries
-# ✅ Tries different approach
-# ✅ Up to 2 retries
-```
-
-**Winner:** `agent_graph.py` — only one with automatic retry.
+**Winner:** `agent.py`
 
 ---
 
@@ -179,69 +108,54 @@ python agent_graph.py "curl https://api.example.com" --no-approval
 ```
 What do you need?
 │
-├─ Simple query (disk usage, date, list files)
-│  → Use agent.py
+├─ Quick query (disk, date, RAM, list files)
+│  → agent.py
 │
-├─ Multi-step task with specialists (review→fix→test, research→analyze→write)
-│  → Use crew.py
+├─ Coding task (add feature, fix bug, add docstring)
+│  ├─ Need test verification → agent_graph.py --plan
+│  └─ Quick edit → agent.py
 │
-├─ File write that needs approval
-│  → Use agent_graph.py
+├─ Multi-step with specialists (review→fix→test, research→analyze→write)
+│  → crew.py
 │
-├─ Command that might fail and needs retry
-│  → Use agent_graph.py
+├─ Sensitive file write (need approval + preview)
+│  → agent_graph.py
 │
-├─ Long task you might need to pause and resume
-│  → Use agent_graph.py
+├─ Command that might fail (need retry)
+│  → agent_graph.py
 │
-└─ Complex task with validation loop
-   → Use agent_graph.py
+├─ Long task you might pause and resume
+│  → agent_graph.py --no-checkpoints removed
+│
+└─ Fetch and read a full webpage
+   → agent.py (fetch_url tool)
 ```
 
 ---
 
-## Performance Comparison
+## Performance
 
 **Speed (fastest to slowest):**
-1. `agent.py` — 1 LLM call, no overhead
-2. `agent_graph.py` — 1-3 LLM calls (depends on retries/validation)
+1. `agent.py` — 1-2 LLM calls, streaming
+2. `agent_graph.py` — 2-4 LLM calls (graph overhead)
 3. `crew.py` — 3+ LLM calls (one per agent)
 
 **Safety (safest to riskiest):**
-1. `agent_graph.py` — approval + retry + validation
+1. `agent_graph.py` — approval + retry + test loop + validation
 2. `crew.py` — specialists reduce errors
-3. `agent.py` — no safety features
+3. `agent.py` — error recovery but no approval
 
-**Complexity (simplest to most complex):**
-1. `agent.py` — ~300 lines, straightforward
-2. `crew.py` — ~650 lines, multi-agent orchestration
-3. `agent_graph.py` — ~450 lines, graph workflow
-
----
-
-## Combining Them
-
-You can use all three in the same project:
-
-```bash
-# Quick system check
-python agent.py "check RAM usage"
-
-# Complex code review
-python crew.py code "review and improve agent.py"
-
-# Sensitive file operation
-python agent_graph.py "create production config" 
-```
-
-Each tool has its place. Choose based on the task requirements.
+**Tools available:**
+1. `agent.py` — 12 tools (most complete)
+2. `agent_graph.py` — 7 tools
+3. `crew.py` — 7 tools
 
 ---
 
 ## Summary
 
-- **agent.py** = Swiss Army knife (fast, simple, good for most things)
-- **crew.py** = Specialist team (slow but thorough for complex tasks)
-- **agent_graph.py** = Safety-first (approval, retry, validation)
+- **agent.py** = Daily driver (fast, 12 tools, memory, session continuity)
+- **crew.py** = Specialist team (slow but thorough, multi-agent pipeline)
+- **agent_graph.py** = Safety-first coding agent (approval, test loop, planning)
 
-All three share the same tools and RAG memory, so they're complementary, not competing.
+All three support Ollama, Cloudflare, OpenAI, and Groq via `LLM_PROVIDER` in `.env`.

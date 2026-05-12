@@ -1,262 +1,254 @@
-# LangGraph Integration Guide
+# LangGraph Agent Guide
 
-## What Was Added
+## What agent_graph.py Does
 
-`agent_graph.py` — A LangGraph-powered agent with advanced features that `agent.py` doesn't have.
+`agent_graph.py` is a LangGraph-powered coding agent with two phases of features:
+
+- **Phase 1** — Human approval, retry logic, validation, checkpointing
+- **Phase 2** — Test→fix loop, multi-file planning, git write operations
 
 ---
 
-## Key Features
+## Phase 1 Features
 
-### 1. **Human-in-the-Loop Approval**
+### 1. Human-in-the-Loop Approval
 
-**Problem in `agent.py`:** When you ask it to create a file, it writes immediately. If it misunderstands, the wrong content is already on disk.
+Pauses before any `write_file` or `git_write` operation and shows a preview:
 
-**Solution in `agent_graph.py`:**
-```bash
-python agent_graph.py "create a config.json file"
+```
+🚨 FILE WRITE APPROVAL REQUIRED
+Path: config.json
+Content preview:
+------------------------------------------------------------
+{"debug": true, "port": 8080}
+------------------------------------------------------------
+
+Approve? (y/n): _
 ```
 
-The agent will:
-1. Generate the file content
-2. **PAUSE** and show you a preview
-3. Ask: "Approve this write? (y/n)"
-4. Only write if you say 'y'
-
-**How it works:**
-- `check_approval_needed` node detects `write_file` tool calls
-- Routes to `human_approval_node` which pauses execution
-- User reviews and approves/rejects
-- Only then does `tools` node execute the write
+Disable with `--no-approval` for non-sensitive tasks.
 
 ---
 
-### 2. **Automatic Retry Logic**
+### 2. Automatic Retry Logic
 
-**Problem in `agent.py`:** If a command fails (network timeout, wrong path), the agent just returns the error and moves on.
-
-**Solution in `agent_graph.py`:**
-```bash
-python agent_graph.py "curl https://api.example.com/data"
-```
-
-If the curl fails:
-1. `retry_node` detects the `ERROR[...]` in the tool result
-2. Automatically retries up to 2 times
-3. Asks the agent to try a different approach
-4. If still fails after 2 retries, explains the issue to the user
-
-**How it works:**
-- All tools return errors in format: `ERROR[TYPE]: message`
-- `route_after_tools` checks for `ERROR[` in tool results
-- Routes to `retry_node` which increments retry counter
-- Loops back to `agent` with feedback
+If a tool returns `ERROR[...]`, the retry node:
+1. Detects the error
+2. Feeds it back to the agent with "try a different approach"
+3. Retries up to 2 times
+4. After max retries, explains the issue to the user
 
 ---
 
-### 3. **Conditional Branching**
+### 3. Conditional Branching
 
-**Problem in `agent.py`:** Linear flow only — every step runs even if unnecessary.
-
-**Solution in `agent_graph.py`:**
-
-The graph has multiple paths:
+The graph routes dynamically based on what the agent does:
 
 ```
 agent
-  ├─ No tools needed? → END (skip everything)
-  └─ Tools needed?
-       ├─ write_file? → approval → tools → agent
-       └─ other tool? → tools → agent
+  ├─ No tools called? → END
+  └─ Tools called?
+       ├─ write_file or git_write? → approval → tools
+       └─ other tool? → tools directly
+              ↓
+           retry (if error)
+              ↓
+           agent (continue)
 ```
 
-**How it works:**
-- `route_after_agent` checks if tools were called
-- `route_after_approval_check` decides if approval is needed
-- Each routing function returns a string that determines the next node
+---
+
+### 4. Validation Loop
+
+After the agent responds, `validator_node` checks:
+- Response too short (< 10 chars)? → loop back with feedback
+- Mentions ERROR but doesn't explain? → loop back
+- Passes? → end
+
+Maximum 3 iterations.
 
 ---
 
-### 4. **Iterative Refinement Loop**
-
-**Problem in `agent.py`:** Agent responds once and stops. If the response is bad, you have to manually ask it to improve.
-
-**Solution in `agent_graph.py`:**
-
-The `validator_node` checks the agent's response:
-- Too short? Loop back with feedback
-- Contains errors but no explanation? Loop back
-- Passes validation? Continue
-
-Maximum 3 iterations to prevent infinite loops.
-
-**How it works:**
-- `validator_node` runs validation rules
-- Sets `validation_passed` to True/False
-- `route_after_validation` loops back to `agent` if validation failed
-
----
-
-### 5. **Persistent State (Checkpointing)**
-
-**Problem in `agent.py`:** If you close the terminal mid-task, all progress is lost.
-
-**Solution in `agent_graph.py`:**
+### 5. Checkpointing
 
 ```bash
 # Start a task
-python agent_graph.py "review all Python files and write a report"
-# [agent is working...]
-# [you close the terminal]
+python agent_graph.py "complex task"
+# [Ctrl+C to interrupt]
 
-# Next day, resume exactly where you left off
+# Resume exactly where you left off
 python agent_graph.py --resume
 ```
 
-**How it works:**
-- `MemorySaver` checkpointer saves the entire graph state after each node
-- State includes: messages, retry count, approval status, iteration count
-- `--resume` flag loads the last checkpoint and continues
+Uses `MemorySaver` (in-memory). For persistence across restarts, switch to `SqliteSaver`.
 
 ---
 
-## Usage Examples
+## Phase 2 Features
 
-### Basic Usage (No Approval)
+### 6. Test → Fix Loop
+
+After any code edit, the agent automatically:
+1. Runs `pytest` on the project
+2. If tests fail → feeds failure details back to agent
+3. Agent fixes the code using `edit_file`
+4. Runs tests again
+5. Repeats up to 3 times
+
 ```bash
-venv/bin/python agent_graph.py "check disk usage" --no-approval
+python agent_graph.py "fix the bug in rag.py"
+# → edits rag.py
+# → runs pytest
+# → if tests fail, fixes and retries
+# → stops when tests pass or max attempts reached
 ```
 
-### With Approval (Default)
-```bash
-venv/bin/python agent_graph.py "create a hello.py file"
-# Agent generates content
-# Shows preview
-# Waits for your approval
+Disable with `--no-tests`.
+
+---
+
+### 7. Multi-File Planning
+
+Before touching any code, the agent produces a structured plan:
+
+```
+📋 IMPLEMENTATION PLAN
+============================================================
+PLAN:
+1. File: rag.py    Action: edit    Reason: add cleanup method
+2. File: agent.py  Action: edit    Reason: call cleanup on load
+
+SUMMARY: Add RAG store cleanup to prevent unbounded growth
+
+Approve this plan? (y/n/edit): _
 ```
 
-### Disable Checkpoints (Faster)
-```bash
-venv/bin/python agent_graph.py "list files" --no-approval --no-checkpoints
+You can approve, reject, or edit the plan before execution begins.
+
+Enable with `--plan` flag.
+
+---
+
+### 8. Git Write Operations
+
+The `git_write` tool supports:
+- `git_write(action="branch", branch="feature-x")` — create branch
+- `git_write(action="stage", files="rag.py")` — stage files
+- `git_write(action="commit", message="fix: add cleanup")` — commit
+
+All git writes require human approval (same approval flow as file writes).
+
+---
+
+## Cloudflare Multi-Tool Support
+
+In Cloudflare mode, `agent_node` runs a multi-turn loop (up to 6 turns):
+
+```
+Turn 1: model says TOOL_CALL: read_file → execute → feed result back
+Turn 2: model says TOOL_CALL: edit_file → execute → feed result back
+Turn 3: model says TOOL_CALL: run_tests → execute → feed result back
+Turn 4: model says FINAL_ANSWER: done → break loop
 ```
 
-### Resume After Restart
+This enables multi-step coding workflows on Cloudflare without native tool-calling support.
+
+---
+
+## Usage
+
 ```bash
-venv/bin/python agent_graph.py --resume
+# Basic — with tests, with approval
+python agent_graph.py "fix the bug in rag.py"
+
+# With planning
+python agent_graph.py "add error handling to agent.py" --plan
+
+# Skip tests (for non-code tasks)
+python agent_graph.py "check disk usage" --no-tests --no-approval
+
+# Skip approval (for trusted tasks)
+python agent_graph.py "list files" --no-approval --no-checkpoints
+
+# Resume last task
+python agent_graph.py --resume
+
+# All flags
+python agent_graph.py "task" --plan --no-approval --no-tests --no-checkpoints
 ```
 
 ---
 
-## Architecture Comparison
-
-| Feature | `agent.py` | `agent_graph.py` |
-|---|---|---|
-| Tool execution | Immediate | Can pause for approval |
-| Error handling | Returns error, moves on | Automatic retry (up to 2x) |
-| Flow control | Linear only | Conditional branching |
-| Validation | None | Iterative refinement loop |
-| State persistence | None | Checkpointing (resume later) |
-| Complexity | Simple | More complex but more powerful |
-
----
-
-## The Graph Structure
+## Graph Structure
 
 ```
 START
   │
   ▼
-agent (decides what to do)
+[planner] (if --plan)
+  │
+  ▼
+[agent] ← LLM decides what to do
   │
   ├─ No tools? → END
   │
   └─ Tools needed?
        │
        ▼
-     check_approval (is it write_file?)
+  [check_approval]
        │
-       ├─ Yes → approval (human reviews) → tools
-       │
-       └─ No → tools (execute immediately)
+       ├─ write_file/git_write? → [approval] → [tools]
+       └─ other? → [tools]
               │
               ▼
-            retry (did tool fail?)
+           [retry] (if ERROR[...])
               │
-              ├─ Yes → agent (try again)
+              └─ → [agent] (try again)
               │
-              └─ No → agent (continue)
-                     │
-                     ▼
-                   validator (check response quality)
-                     │
-                     ├─ Failed → agent (refine)
-                     │
-                     └─ Passed → END
+              ▼ (no error)
+           [agent]
+              │
+              ├─ code changed? → [run_tests]
+              │       │
+              │       ├─ tests failed? → [agent] (fix)
+              │       └─ tests passed? → END
+              │
+              └─ no code change? → END
 ```
 
 ---
 
-## When to Use Which Agent
+## Tools Available
 
-**Use `agent.py` when:**
-- Simple, straightforward tasks
-- You trust the agent completely
-- Speed is more important than safety
-- No need to resume later
-
-**Use `agent_graph.py` when:**
-- File writes need approval
-- Tools might fail and need retries
-- Complex multi-step tasks
-- You might need to pause and resume
-- Response quality matters (validation loop)
+| Tool | Purpose |
+|---|---|
+| `run_shell` | Shell commands |
+| `read_file` | Read files |
+| `write_file` | Create new files (requires approval) |
+| `edit_file` | Surgical str_replace edits |
+| `list_directory` | List files/folders |
+| `run_tests` | Run pytest and return results |
+| `git_write` | Stage/commit/branch (requires approval) |
 
 ---
 
 ## Configuration
 
-### Disable Approval Globally
-Edit `agent_graph.py` line 393:
+### Change retry limit
 ```python
-enable_approval = "--no-approval" not in flags
-# Change to:
-enable_approval = False  # always disabled
+# In retry_node:
+if retry_count < 2:  # change to 5 for more retries
 ```
 
-### Change Retry Limit
-Edit `agent_graph.py` line 177:
+### Change test fix attempts
 ```python
-if retry_count < 2:  # max 2 retries
-# Change to:
-if retry_count < 5:  # max 5 retries
+# In route_after_tests:
+if state.get("fix_attempts", 0) >= 3:  # change limit
 ```
 
-### Change Validation Rules
-Edit `validator_node` function (line 195) to add your own rules.
-
----
-
-## Troubleshooting
-
-**"Cannot resume without checkpoints"**
-- Remove `--no-checkpoints` flag
-- Checkpoints are required for `--resume`
-
-**Agent is slow**
-- Use `--no-checkpoints` for faster execution
-- Checkpointing adds overhead
-
-**Approval prompt doesn't appear**
-- Make sure you didn't use `--no-approval` flag
-- Only `write_file` tool triggers approval
-
----
-
-## Next Steps
-
-1. **Try it:** Run a simple task with approval enabled
-2. **Test retry:** Run a command that will fail (e.g., `curl https://invalid-url`)
-3. **Test resume:** Start a long task, kill it, then `--resume`
-4. **Customize:** Add your own validation rules or routing logic
-
-The graph is fully extensible — you can add new nodes, new routing logic, or new validation rules without changing the core structure.
+### Add custom validation rules
+```python
+# In validator_node, add your own checks:
+if "TODO" in content:
+    return {"validation_passed": False, "messages": [...]}
+```

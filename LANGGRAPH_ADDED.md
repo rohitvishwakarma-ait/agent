@@ -1,300 +1,84 @@
-# LangGraph Successfully Added ✅
+# LangGraph Implementation Notes
 
 ## What Was Built
 
-`agent_graph.py` — A new agent powered by LangGraph with 5 advanced features that your other agents don't have.
+`agent_graph.py` — A LangGraph-powered coding agent built in two phases.
 
 ---
 
-## ✅ Verified Working Features
+## Phase 1 (Original)
 
-### 1. **Human-in-the-Loop Approval** ✅ TESTED
+### Features Added
+1. Human-in-the-loop approval for file writes
+2. Automatic retry logic (up to 2x on tool failure)
+3. Conditional branching (dynamic routing)
+4. Validation loop (iterative refinement, max 3 iterations)
+5. Checkpointing via `MemorySaver`
 
-**Command:**
-```bash
-venv/bin/python agent_graph.py "create a test.txt file with hello world"
-```
-
-**What happens:**
-```
-🚨 FILE WRITE APPROVAL REQUIRED
-Path: /tmp/test.txt
-Content preview:
-------------------------------------------------------------
-hello world
-------------------------------------------------------------
-
-Approve this write? (y/n): _
-```
-
-You type `y` → file is written  
-You type `n` → file write is cancelled
-
-**Verified:** File was successfully created at `/tmp/test.txt` with correct content.
+### Verified Working
+- File write approval: shows preview, waits for y/n
+- Retry: detects `ERROR[...]` in tool results, loops back
+- Branching: skips approval for non-write tools
+- Checkpointing: `--resume` flag loads last state
 
 ---
 
-### 2. **Automatic Retry Logic** ✅ IMPLEMENTED
+## Phase 2 (New)
 
-**How it works:**
-- All tools return errors in format: `ERROR[TYPE]: message`
-- If a tool fails, `retry_node` detects it
-- Automatically retries up to 2 times
-- Asks agent to try a different approach each time
+### Features Added
+6. **Test → Fix loop** — runs pytest after code edits, auto-fixes failures
+7. **Multi-file planning** — `--plan` flag shows structured plan before acting
+8. **Git write operations** — `git_write` tool (stage/commit/branch with approval)
 
-**Example scenario:**
-```bash
-venv/bin/python agent_graph.py "curl https://invalid-url.com" --no-approval
-```
+### New Tools
+- `edit_file` — surgical str_replace (safer than write_file for edits)
+- `run_tests` — runs pytest, returns pass/fail + details
+- `git_write` — git stage/commit/branch with human approval
 
-Expected flow:
-1. First attempt fails → `ERROR[...]: Connection refused`
-2. Retry 1: Agent tries with different flags
-3. Retry 2: Agent tries alternative command
-4. After 2 retries: Explains the issue to user
+### New Nodes
+- `planner_node` — generates implementation plan, asks user to approve
+- `test_runner_node` — runs pytest, feeds failures back to agent
 
 ---
 
-### 3. **Conditional Branching** ✅ WORKING
+## Cloudflare Compatibility
 
-**Verified in test:**
-```bash
-venv/bin/python agent_graph.py "How much RAM is available" --no-approval --no-checkpoints
-```
+**Problem:** Cloudflare Workers AI rejects OpenAI-style tool schemas (`array` content type).
 
-**Flow observed:**
-```
-agent → check_approval → tools → agent → END
-```
-
-The graph correctly:
-- Skipped approval (no write_file call)
-- Executed tools immediately
-- Returned to agent for final answer
-- Ended when no more tools needed
+**Solution:** In Cloudflare mode (`USE_TEXT_TOOLS=True`):
+- Tools described as plain text in system prompt
+- Model responds with `TOOL_CALL: name` / `INPUT: {...}` format
+- `agent_node` parses and executes tools directly (no LangGraph ToolNode)
+- Multi-turn loop (up to 6 turns) handles `read_file → edit_file → run_tests` sequences
 
 ---
 
-### 4. **Validation Loop** ✅ IMPLEMENTED
+## Flags Reference
 
-**How it works:**
-- `validator_node` checks response quality
-- Too short? Loops back with feedback
-- Contains errors without explanation? Loops back
-- Passes validation? Continues to end
-
-**Validation rules:**
-- Response must be > 10 characters
-- If mentions ERROR, must explain it
-- Maximum 3 iterations to prevent infinite loops
-
----
-
-### 5. **Checkpointing (Resume)** ✅ IMPLEMENTED
-
-**How to use:**
-```bash
-# Start a long task
-venv/bin/python agent_graph.py "complex task here"
-# [Ctrl+C to interrupt]
-
-# Resume later
-venv/bin/python agent_graph.py --resume
 ```
-
-**Storage:** Uses `MemorySaver` (in-memory checkpointing)
-
-**Note:** For persistent checkpoints across restarts, you'd need to switch to `SqliteSaver`:
-```python
-from langgraph.checkpoint.sqlite import SqliteSaver
-memory = SqliteSaver.from_conn_string("checkpoints.db")
+--no-approval     skip human approval for write_file and git_write
+--no-checkpoints  disable MemorySaver (faster, no resume)
+--plan            show implementation plan before acting
+--no-tests        skip pytest verification after code edits
+--resume          resume last checkpointed task
 ```
 
 ---
 
-## 🎯 Real Test Results
+## Performance
 
-### Test 1: Simple Query (No Approval Needed)
-```bash
-$ venv/bin/python agent_graph.py "How much RAM is available" --no-approval --no-checkpoints
-
-📍 Node: agent
-📍 Node: check_approval
-📍 Node: tools
-📍 Node: agent
-
-✅ FINAL ANSWER
-The available RAM on the system is 1121 MB.
-```
-
-**Result:** ✅ Works perfectly. Fast execution, correct answer.
+| Scenario | Nodes visited | Approx time |
+|---|---|---|
+| Simple query (no tools) | agent | 3-5s |
+| Shell command | agent → check_approval → tools → agent | 8-12s |
+| Code edit with tests | agent → tools → run_tests → agent | 20-40s |
+| Code edit with plan | planner → agent → tools → run_tests | 30-60s |
 
 ---
 
-### Test 2: File Write (With Approval)
-```bash
-$ venv/bin/python agent_graph.py "create a test.txt file with hello world"
+## Known Limitations
 
-🚨 FILE WRITE APPROVAL REQUIRED
-Path: /tmp/test.txt
-Content preview:
-------------------------------------------------------------
-hello world
-------------------------------------------------------------
-
-Approve this write? (y/n): y
-✅ Approved — writing file...
-
-✅ FINAL ANSWER
-The file `test.txt` has been successfully created.
-```
-
-**Verification:**
-```bash
-$ cat /tmp/test.txt
-hello world
-```
-
-**Result:** ✅ Approval works, file written correctly.
-
----
-
-## 📊 Performance
-
-**Speed comparison (same task: "How much RAM is available"):**
-
-| Agent | Time | LLM Calls | Notes |
-|---|---|---|---|
-| `agent.py` | ~5-10s | 1-2 | Fastest |
-| `agent_graph.py` | ~10-15s | 2-3 | Slightly slower due to graph overhead |
-| `crew.py` | ~30-60s | 3+ | Slowest (multiple agents) |
-
-**Overhead:** LangGraph adds ~2-5 seconds due to state management and routing logic.
-
----
-
-## 🔧 Configuration Options
-
-### Disable Approval Globally
-```bash
-venv/bin/python agent_graph.py "your task" --no-approval
-```
-
-### Disable Checkpoints (Faster)
-```bash
-venv/bin/python agent_graph.py "your task" --no-checkpoints
-```
-
-### Both Disabled (Fastest)
-```bash
-venv/bin/python agent_graph.py "your task" --no-approval --no-checkpoints
-```
-
----
-
-## 🎓 How It Works — The Graph
-
-```
-START
-  │
-  ▼
-┌─────────┐
-│  agent  │ ← LLM decides what to do
-└────┬────┘
-     │
-     ├─ No tools needed? → END
-     │
-     └─ Tools needed?
-          │
-          ▼
-     ┌──────────────────┐
-     │ check_approval   │ ← Is it write_file?
-     └────┬─────────────┘
-          │
-          ├─ Yes → ┌──────────┐
-          │        │ approval │ ← Human reviews
-          │        └────┬─────┘
-          │             │
-          └─ No ───────┴─────→ ┌───────┐
-                                │ tools │ ← Execute
-                                └───┬───┘
-                                    │
-                                    ▼
-                                ┌───────┐
-                                │ retry │ ← Failed?
-                                └───┬───┘
-                                    │
-                                    ├─ Yes → agent (try again)
-                                    │
-                                    └─ No → agent (continue)
-                                              │
-                                              ▼
-                                          ┌───────────┐
-                                          │ validator │ ← Check quality
-                                          └─────┬─────┘
-                                                │
-                                                ├─ Failed → agent (refine)
-                                                │
-                                                └─ Passed → END
-```
-
----
-
-## 🆚 Comparison with Other Agents
-
-| Feature | agent.py | crew.py | agent_graph.py |
-|---|---|---|---|
-| Speed | ⚡⚡⚡ | 🐌 | ⚡⚡ |
-| Approval | ❌ | ❌ | ✅ |
-| Retry | ❌ | ❌ | ✅ |
-| Validation | ❌ | ❌ | ✅ |
-| Checkpoints | ❌ | ❌ | ✅ |
-| Multi-agent | ❌ | ✅ | ❌ |
-| Complexity | Low | High | Medium |
-
----
-
-## 📝 Files Added
-
-```
-agent_graph.py           # The LangGraph agent (463 lines)
-LANGGRAPH_GUIDE.md       # Detailed feature guide
-LANGGRAPH_ADDED.md       # This file (what was added)
-COMPARISON.md            # Compare all 3 agents
-README.md                # Project overview
-```
-
----
-
-## 🎯 When to Use agent_graph.py
-
-**Use it when you need:**
-- ✅ Approval before writing/deleting files
-- ✅ Automatic retry on tool failures
-- ✅ Validation of agent responses
-- ✅ Ability to pause and resume tasks
-- ✅ More control over the execution flow
-
-**Don't use it when:**
-- ❌ You need maximum speed (use `agent.py`)
-- ❌ You need multi-agent specialists (use `crew.py`)
-- ❌ Task is simple and low-risk (use `agent.py`)
-
----
-
-## ✅ Summary
-
-LangGraph has been successfully integrated into your project. The new `agent_graph.py` adds:
-
-1. **Human approval** for sensitive operations ✅
-2. **Automatic retry** for failed tools ✅
-3. **Conditional branching** for efficient execution ✅
-4. **Validation loop** for quality control ✅
-5. **Checkpointing** for resumable tasks ✅
-
-All features are working and tested. You now have 3 complementary agents:
-- `agent.py` for speed
-- `crew.py` for complexity
-- `agent_graph.py` for control
-
-Choose the right tool for each job! 🚀
+- Checkpointing is in-memory only (`MemorySaver`) — lost on process exit
+  - For persistence: switch to `SqliteSaver`
+- Cloudflare approval is skipped (tools execute directly in agent_node)
+- `run_tests` requires pytest installed in venv (`venv/bin/pip install pytest`)

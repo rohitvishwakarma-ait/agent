@@ -1,6 +1,6 @@
 # Custom AI Agent Project
 
-A complete AI agent system built from scratch in Python, featuring three different agent architectures for different use cases.
+A complete AI agent system built from scratch in Python, featuring three agent architectures, Claude Code-like editing capabilities, multi-provider LLM support, and persistent memory.
 
 ---
 
@@ -12,18 +12,18 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Pull required Ollama models
+# Pull required Ollama models (for local inference)
 ollama pull qwen2:7b
 ollama pull nomic-embed-text
 
 # Configure environment
 cp .env.example .env
-# Edit .env and add your API keys (optional)
+# Edit .env — set LLM_PROVIDER and add API keys
 
 # Run agents
 python agent.py "check disk usage"
 python crew.py devops "system health report"
-python agent_graph.py "create a hello.py file"
+python agent_graph.py "fix the bug in rag.py" --plan
 ```
 
 ---
@@ -32,39 +32,64 @@ python agent_graph.py "create a hello.py file"
 
 ```
 .
-├── agent.py              # Simple single agent (fast, straightforward)
-├── agent_graph.py        # LangGraph agent (approval, retry, validation)
-├── crew.py               # Multi-agent crews (specialists for complex tasks)
-├── rag.py                # RAG memory system (shared across all agents)
+├── agent.py              # LangChain agent — fast, streaming, 12 tools
+├── agent_graph.py        # LangGraph agent — approval, retry, test loop, planning
+├── crew.py               # CrewAI multi-agent — 3 crews, 9 specialists
+├── rag.py                # RAG memory — vector + keyword fallback
+├── llm_config.py         # Unified LLM provider config
 │
 ├── rag.store.json        # Vector store (persistent memory)
-├── .env                  # API keys (not committed)
+├── session.json          # Short-term session memory (last 20 messages)
+├── .env                  # API keys and provider config (not committed)
+├── .env.example          # Config template
 ├── requirements.txt      # Python dependencies
 │
-├── LANGGRAPH_GUIDE.md    # LangGraph features explained
+├── README.md             # This file
 ├── COMPARISON.md         # Which agent to use when
-└── README.md             # This file
+├── PROJECT_OVERVIEW.md   # Complete architecture
+├── LANGGRAPH_GUIDE.md    # LangGraph features deep dive
+└── LANGGRAPH_ADDED.md    # LangGraph implementation notes
 ```
 
 ---
 
-## 🤖 Three Agents, Three Purposes
+## 🤖 Three Agents
 
-### 1. **agent.py** — Simple & Fast
+### 1. **agent.py** — Fast & Feature-Rich
 
-**Best for:** Quick queries, system checks, simple tasks
+**Best for:** Quick queries, coding tasks, system checks, web research
+
+**Tools (12 total):**
+
+| Tool | Purpose |
+|---|---|
+| `run_shell` | Shell commands (ps, df, free, uptime) |
+| `read_file` | Read any file |
+| `write_file` | Create new files |
+| `list_directory` | List files/folders |
+| `web_search` | DuckDuckGo / Brave search |
+| `http_request` | Call any REST API |
+| `git_tool` | Read-only git (log, status, diff) |
+| `index_codebase` | Scan project — extract all symbols |
+| `edit_file` | Surgical str_replace edits (Phase 1) |
+| `preview_diff` | Show diff before applying (Phase 1) |
+| `extract_symbol` | Extract one function/class via AST (Phase 3) |
+| `fetch_url` | Fetch full webpage content (Phase 3) |
 
 **Features:**
-- 7 tools (shell, files, web search, git, HTTP)
-- RAG memory (remembers facts across sessions)
-- Streaming responses
-- Interactive mode
+- Streaming responses (Ollama) / word-by-word simulation (Cloudflare)
+- RAG memory with vector + keyword fallback
+- Session continuity via `session.json`
+- Project-aware startup (auto-loads README + file structure)
+- Session change tracker (`/session` command)
+- Token/cost tracking
+- Error recovery with exponential backoff retry
 
-**Example:**
 ```bash
 python agent.py "what is my CPU usage"
-python agent.py "read package.json and list dependencies"
-python agent.py  # interactive mode
+python agent.py "add a docstring to the run_task function in agent.py"
+python agent.py "fetch https://docs.python.org/3/ and summarize"
+python agent.py  # interactive mode — type /session, /clear, /exit
 ```
 
 ---
@@ -73,21 +98,16 @@ python agent.py  # interactive mode
 
 **Best for:** Complex multi-step tasks requiring specialists
 
-**Features:**
-- 3 crews with 9 specialized agents total
-- Each agent has one focused job
-- Sequential workflow (output flows between agents)
-- Structured results
-
 **Crews:**
 - **CodeCrew:** Reviewer → Fixer → Tester
 - **ResearchCrew:** Researcher → Analyst → Writer
 - **DevOpsCrew:** SysAdmin → GitInspector → ReportWriter
 
-**Example:**
+**Providers supported:** Ollama, Cloudflare, OpenAI, Groq (set `LLM_PROVIDER` in `.env`)
+
 ```bash
 python crew.py code "review agent.py and fix bugs"
-python crew.py research "latest Python features"
+python crew.py research "latest Python 3.13 features"
 python crew.py devops "full system health report"
 ```
 
@@ -95,154 +115,103 @@ python crew.py devops "full system health report"
 
 ### 3. **agent_graph.py** — Advanced Control
 
-**Best for:** Tasks needing approval, retry, or validation
+**Best for:** Coding tasks, sensitive operations, tasks needing verification
 
-**Features:**
-- ✅ Human-in-the-loop approval (for file writes)
-- ✅ Automatic retry logic (up to 2x on failure)
-- ✅ Conditional branching (skip unnecessary steps)
-- ✅ Validation loop (iterative refinement)
-- ✅ Checkpointing (resume after restart)
+**Phase 1 features:**
+- Human-in-the-loop approval (file writes, git operations)
+- Automatic retry logic (up to 2x on tool failure)
+- Conditional branching
+- Validation loop (iterative refinement)
+- Checkpointing (resume after restart)
 
-**Example:**
+**Phase 2 features:**
+- Test → Fix loop (runs pytest after edits, auto-fixes failures)
+- Multi-file planning (`--plan` flag shows plan before acting)
+- Git write operations (commit, branch, stage — with approval)
+
 ```bash
-python agent_graph.py "create a config.json file"
-# Shows preview, waits for approval
-
-python agent_graph.py "curl https://api.example.com" --no-approval
-# Automatically retries if it fails
-
+python agent_graph.py "fix the bug in rag.py" --plan
+python agent_graph.py "check disk usage" --no-tests --no-approval
+python agent_graph.py "add feature X" --plan --no-checkpoints
 python agent_graph.py --resume
-# Resume from last checkpoint
+```
+
+**Flags:**
+```
+--no-approval     skip human approval for writes
+--no-checkpoints  disable state persistence
+--plan            show implementation plan before acting
+--no-tests        skip test verification loop
+--resume          resume last checkpointed task
 ```
 
 ---
 
 ## 🧠 Memory System
 
-All three agents share the same RAG (Retrieval-Augmented Generation) memory:
+### Long-term Memory — `rag.store.json`
+- Stores factual statements as 768-dim vectors
+- Semantic search via cosine similarity
+- Falls back to keyword search if Ollama is down
+- Auto-cleanup: removes entries older than 30 days, caps at 200 entries
+- Deduplication: never stores the same fact twice
+- Only stores facts, not questions
 
-**What it stores:**
-- Personal facts ("my name is Rohit")
-- Preferences ("I prefer dark mode")
-- Project context ("I'm building an AI agent")
+### Short-term Memory — `session.json`
+- Stores last 20 messages between runs
+- Loaded on startup as `chat_history`
+- Gives the agent context from your previous conversation
 
-**What it doesn't store:**
-- System query results (disk usage, ports) — always runs fresh
-- Temporary data
-
-**Storage:** `rag.store.json` (768-dim vectors via `nomic-embed-text`)
-
-**Example:**
 ```bash
 # Session 1
 python agent.py "my name is Rohit and I work at AIT Global India"
 
-# Session 2 (next day, fresh process)
-python agent.py "what is my name and where do I work?"
-# → "Your name is Rohit and you work at AIT Global India"
+# Session 2 (next day)
+python agent.py "where do I work?"
+# → "You work at AIT Global India" (from RAG)
+# → Also remembers recent conversation context (from session.json)
 ```
 
 ---
 
-## 🛠️ Available Tools
+## 🔧 LLM Provider Configuration
 
-All agents have access to these 7 tools:
+Set `LLM_PROVIDER` in `.env` to switch providers:
 
-| Tool | What it does |
-|---|---|
-| `run_shell` | Execute shell commands (ps, df, free, uptime, etc.) |
-| `read_file` | Read any file from disk |
-| `write_file` | Create or overwrite files |
-| `list_directory` | List files and folders |
-| `web_search` | Search DuckDuckGo (or Brave with API key) |
-| `http_request` | Call any REST API |
-| `git_tool` | Read-only git commands (log, status, diff) |
+```bash
+LLM_PROVIDER=ollama       # local, free, default
+LLM_PROVIDER=cloudflare   # fast, cheap
+LLM_PROVIDER=openai       # powerful
+LLM_PROVIDER=groq         # extremely fast
+LLM_PROVIDER=anthropic    # excellent reasoning
+LLM_PROVIDER=gemini       # large context
+```
+
+Test a provider:
+```bash
+python llm_config.py list              # show all providers + status
+python llm_config.py test ollama       # test Ollama
+python llm_config.py test cloudflare   # test Cloudflare
+```
 
 ---
 
-## 📊 Performance Comparison
+## 📊 Agent Comparison
 
-| Metric | agent.py | crew.py | agent_graph.py |
+| Feature | agent.py | crew.py | agent_graph.py |
 |---|---|---|---|
 | Speed | ⚡ Fast | 🐌 Slow | ⚡ Medium |
-| Safety | ⚠️ None | ✅ Specialists | ✅✅ Approval+Retry |
-| Complexity | Simple | Medium | High |
-| Best for | Quick tasks | Multi-step | Sensitive ops |
-
----
-
-## 🎯 Which Agent Should I Use?
-
-```
-Need to...
-│
-├─ Check system info, list files, quick query
-│  → agent.py
-│
-├─ Review code → fix bugs → write tests
-│  → crew.py code
-│
-├─ Research topic → analyze → write report
-│  → crew.py research
-│
-├─ Create/edit files (need approval)
-│  → agent_graph.py
-│
-├─ Run command that might fail (need retry)
-│  → agent_graph.py
-│
-└─ Long task you might pause and resume
-   → agent_graph.py
-```
-
----
-
-## 🔧 Configuration
-
-### Environment Variables (.env)
-
-```bash
-# Optional: Brave Search API (better web search)
-BRAVE_API_KEY=your_key_here
-
-# Optional: Cloudflare Workers AI (not used by default)
-CF_API_TOKEN=your_token_here
-```
-
-### Ollama Models
-
-```bash
-# Required
-ollama pull qwen2:7b           # Main LLM
-ollama pull nomic-embed-text   # Embeddings for RAG
-
-# Optional alternatives
-ollama pull llama3.1:8b
-ollama pull qwen3.5
-```
-
----
-
-## 📚 Documentation
-
-- **[LANGGRAPH_GUIDE.md](LANGGRAPH_GUIDE.md)** — Deep dive into LangGraph features
-- **[COMPARISON.md](COMPARISON.md)** — Detailed comparison with examples
-
----
-
-## 🧪 Testing
-
-```bash
-# Test simple agent
-python agent.py "what is the current date"
-
-# Test crew
-python crew.py devops "quick health check"
-
-# Test graph agent (no approval for testing)
-python agent_graph.py "list files" --no-approval --no-checkpoints
-```
+| Tools | 12 | 7 | 7 |
+| Streaming | ✅ | ✅ | ❌ |
+| Human approval | ❌ | ❌ | ✅ |
+| Retry logic | ✅ (error recovery) | ❌ | ✅ |
+| Test → fix loop | ❌ | ❌ | ✅ |
+| Multi-file planning | ❌ | ❌ | ✅ |
+| Git writes | ❌ | ❌ | ✅ |
+| Multi-agent | ❌ | ✅ | ❌ |
+| Cloudflare support | ✅ | ✅ | ✅ |
+| Session memory | ✅ | ❌ | ❌ |
+| Token tracking | ✅ | ❌ | ❌ |
 
 ---
 
@@ -250,62 +219,35 @@ python agent_graph.py "list files" --no-approval --no-checkpoints
 
 **"Ollama connection refused"**
 ```bash
-# Start Ollama
 ollama serve
 ```
 
-**"Model not found"**
-```bash
-# Pull the model
-ollama pull qwen2:7b
-```
+**RAG works without Ollama**
+- If Ollama is down, RAG automatically falls back to keyword search
+- You'll see: `⚠️ RAG: Ollama unavailable — using keyword search fallback`
 
-**"OPENAI_API_KEY not set" (CrewAI memory)**
-- CrewAI memory requires OpenAI by default
-- Your RAG memory works without any API key
-- See LANGGRAPH_GUIDE.md for details
+**Cloudflare tool-calling errors**
+- Cloudflare uses text-mode tool calling (not OpenAI schema format)
+- This is handled automatically — no action needed
 
 **Agent is slow**
-- Ollama models are CPU-intensive
-- Use smaller models: `qwen2:3b` instead of `qwen2:7b`
-- Or use `--no-checkpoints` flag for agent_graph.py
+- Use `--no-checkpoints` for agent_graph.py
+- Switch to Cloudflare or Groq for faster inference
 
 ---
 
-## 🎓 Learning Path
+## 📚 Documentation
 
-1. **Start with agent.py** — understand the basics
-2. **Try crew.py** — see multi-agent collaboration
-3. **Explore agent_graph.py** — learn advanced control flow
-4. **Read the code** — everything is documented inline
+- **[COMPARISON.md](COMPARISON.md)** — Which agent to use when
+- **[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)** — Complete architecture
+- **[LANGGRAPH_GUIDE.md](LANGGRAPH_GUIDE.md)** — LangGraph features deep dive
 
 ---
 
 ## 🔮 What's Next
 
-Potential additions:
-- More tools (database, email, Slack, etc.)
-- More crews (data analysis, DevOps automation)
 - Web UI (Gradio or Streamlit)
 - MCP server (expose tools to other IDEs)
+- ChromaDB integration (when RAG exceeds 500 entries)
 - Voice interface (Whisper + TTS)
-
----
-
-## 📝 License
-
-This is a learning project. Use it however you want.
-
----
-
-## 🙏 Acknowledgments
-
-Built with:
-- [LangChain](https://langchain.com) — agent framework
-- [LangGraph](https://langchain-ai.github.io/langgraph/) — graph workflows
-- [CrewAI](https://crewai.com) — multi-agent orchestration
-- [Ollama](https://ollama.ai) — local LLM inference
-
----
-
-**Questions?** Read the guides or check the inline code comments — everything is documented.
+- Image/file attachment support (multimodal)
