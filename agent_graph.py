@@ -50,6 +50,9 @@ CHECKPOINT_FILE = "graph_checkpoint.json"
 from llm_config import get_llm
 llm = get_llm()
 
+# Detect Cloudflare — doesn't support OpenAI tool schema format
+USE_TEXT_TOOLS = getattr(llm, "_cf_text_tools", False)
+
 rag = RAG("rag.store.json")
 
 # ============================================================
@@ -365,20 +368,98 @@ def agent_node(state: AgentState) -> AgentState:
     """Main agent — decides what to do next."""
     messages = state["messages"]
     plan = state.get("plan", "")
-
     plan_context = f"\nCurrent plan:\n{plan}\n" if plan else ""
 
-    system_msg = SystemMessage(
-        f"""You are an expert coding agent with Claude Code-like capabilities.
+    tools_desc = "\n".join([
+        f"- {t.name}: {t.description.splitlines()[0]}"
+        for t in tools
+    ])
+
+    if USE_TEXT_TOOLS:
+        # ── Cloudflare text-mode: describe tools as text, parse TOOL_CALL blocks ──
+        system_content = (
+            f"You are an expert coding agent.\n\n"
+            f"AVAILABLE TOOLS:\n{tools_desc}\n\n"
+            f"To use a tool respond with:\n"
+            f"TOOL_CALL: tool_name\n"
+            f"INPUT: {{\"param\": \"value\"}}\n\n"
+            f"When done respond with:\n"
+            f"FINAL_ANSWER: <your answer>\n"
+            f"{plan_context}"
+        )
+        cf_messages = [{"role": "system", "content": system_content}]
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                cf_messages.append({"role": "user", "content": m.content})
+            elif isinstance(m, AIMessage):
+                cf_messages.append({"role": "assistant", "content": m.content or ""})
+            elif isinstance(m, ToolMessage):
+                cf_messages.append({"role": "user", "content": f"Tool result: {m.content}"})
+
+        response = llm.invoke(cf_messages)
+        text = response.content.strip()
+
+        # Parse TOOL_CALL from response and convert to proper tool_calls format
+        if "TOOL_CALL:" in text:
+            lines = text.splitlines()
+            tool_name  = ""
+            tool_input = {}
+            for line in lines:
+                if line.startswith("TOOL_CALL:"):
+                    tool_name = line.replace("TOOL_CALL:", "").strip()
+                if line.startswith("INPUT:"):
+                    try:
+                        tool_input = json.loads(line.replace("INPUT:", "").strip())
+                    except Exception:
+                        tool_input = {}
+
+            if tool_name in {t.name for t in tools}:
+                # Execute tool directly
+                tool_map = {t.name: t for t in tools}
+                print(f"\n⚙️  [{tool_name}] running...")
+                try:
+                    result = tool_map[tool_name].invoke(tool_input)
+                except Exception as e:
+                    result = f"ERROR[EXCEPTION]: {e}"
+
+                # Track changed files
+                changed = list(state.get("changed_files", []))
+                if tool_name in ("edit_file", "write_file"):
+                    f = tool_input.get("path", "")
+                    if f and f not in changed:
+                        changed.append(f)
+
+                # Feed result back and get final answer in same node
+                # (avoids LangGraph self-loop issues with Cloudflare text-mode)
+                cf_messages.append({"role": "assistant", "content": text})
+                cf_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Tool result:\n{result}\n\n"
+                        f"Now give your FINAL_ANSWER based on this result."
+                    )
+                })
+                final_response = llm.invoke(cf_messages)
+                final_text = final_response.content.strip()
+                if final_text.startswith("FINAL_ANSWER:"):
+                    final_text = final_text.replace("FINAL_ANSWER:", "").strip()
+
+                final_ai_msg = AIMessage(content=final_text)
+                return {
+                    "messages": [response, AIMessage(content=f"[tool:{tool_name}] {result[:200]}"), final_ai_msg],
+                    "changed_files": changed,
+                }
+
+        # No tool call — final answer
+        return {"messages": [response]}
+
+    else:
+        # ── Standard mode: Ollama / OpenAI with native tool binding ──
+        system_msg = SystemMessage(
+            f"""You are an expert coding agent with Claude Code-like capabilities.
 
 AVAILABLE TOOLS:
-- run_shell     : run shell commands
-- read_file     : read a file from disk
-- write_file    : create a NEW file (requires approval)
-- edit_file     : surgically edit an existing file (PREFERRED for changes)
-- list_directory: list files in a folder
-- run_tests     : run pytest tests to verify your changes
-- git_write     : stage/commit/branch (requires approval)
+{tools_desc}
 {plan_context}
 WORKFLOW:
 1. read_file → understand current code
@@ -391,24 +472,29 @@ RULES:
 - After editing code, always run_tests to verify
 - Track which files you changed
 - If tests fail, fix them before finishing"""
-    )
+        )
 
-    response = llm.bind_tools(tools).invoke([system_msg] + messages)
+        response = llm.bind_tools(tools).invoke([system_msg] + messages)
 
-    # Track changed files from tool calls
-    changed = list(state.get("changed_files", []))
-    if hasattr(response, "tool_calls"):
-        for tc in response.tool_calls:
-            if tc["name"] in ("edit_file", "write_file"):
-                f = tc["args"].get("path", "")
-                if f and f not in changed:
-                    changed.append(f)
+        # Track changed files from tool calls
+        changed = list(state.get("changed_files", []))
+        if hasattr(response, "tool_calls"):
+            for tc in response.tool_calls:
+                if tc["name"] in ("edit_file", "write_file"):
+                    f = tc["args"].get("path", "")
+                    if f and f not in changed:
+                        changed.append(f)
 
-    return {"messages": [response], "changed_files": changed}
+        return {"messages": [response], "changed_files": changed}
 
 
 def check_approval_needed(state: AgentState) -> AgentState:
     """Check if the last message needs human approval."""
+    # In Cloudflare text-mode, tools are executed directly in agent_node
+    # so there are no pending tool_calls to approve here
+    if USE_TEXT_TOOLS:
+        return {"needs_approval": False}
+
     last_message = state["messages"][-1]
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         for tc in last_message.tool_calls:
@@ -544,19 +630,17 @@ def route_after_tools(state: AgentState) -> Literal["retry", "agent"]:
 
 def route_after_agent_to_tests(
     state: AgentState,
-) -> Literal["check_approval", "run_tests", "__end__"]:
-    """After agent responds: run tests if code was changed, else normal flow."""
+) -> Literal["agent", "check_approval", "run_tests", "__end__"]:
+    """After agent responds: route based on last message type."""
     last_message  = state["messages"][-1]
     changed_files = state.get("changed_files", [])
 
-    # If agent called tools, handle approval first
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+    # Standard mode only: pending tool_calls → go through approval flow
+    if not USE_TEXT_TOOLS and hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "check_approval"
 
-    # If code files were changed and agent is done, run tests
-    code_changed = any(
-        f.endswith((".py", ".js", ".ts")) for f in changed_files
-    )
+    # Code was changed → run tests before finishing
+    code_changed = any(f.endswith((".py", ".js", ".ts")) for f in changed_files)
     if code_changed and not state.get("test_passed", False):
         return "run_tests"
 
@@ -615,7 +699,16 @@ def build_graph(
 
     # ── Agent → tools or tests ─────────────────────────────
     if enable_tests:
-        workflow.add_conditional_edges("agent", route_after_agent_to_tests)
+        workflow.add_conditional_edges(
+            "agent",
+            route_after_agent_to_tests,
+            {
+                "agent":          "agent",
+                "check_approval": "check_approval",
+                "run_tests":      "run_tests",
+                "__end__":        END,
+            }
+        )
     else:
         workflow.add_conditional_edges("agent", route_after_agent)
 
@@ -719,24 +812,36 @@ def main():
 
         print("🚀 Starting agent...\n")
 
-        final_messages = []
+        all_messages = []
         for event in app.stream(initial_state, config):
             for node_name, node_state in event.items():
                 if node_name != "__end__":
                     print(f"📍 Node: {node_name}")
+                    # Accumulate ALL messages across all nodes
                     if "messages" in node_state:
-                        final_messages = node_state["messages"]
+                        all_messages.extend(node_state["messages"])
 
-        # Print summary
+        # Find last meaningful AIMessage across all accumulated messages
         changed = initial_state.get("changed_files", [])
-        if final_messages:
-            for msg in reversed(final_messages):
-                if isinstance(msg, AIMessage) and msg.content:
-                    print("\n" + "="*60)
-                    print("✅ FINAL ANSWER")
-                    print("="*60)
-                    print(msg.content)
-                    break
+        found_answer = False
+        for msg in reversed(all_messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                content = msg.content.strip()
+                # Skip raw TOOL_CALL responses — not the final answer
+                if content.startswith("TOOL_CALL:") or content.startswith("INPUT:"):
+                    continue
+                # Strip FINAL_ANSWER: prefix if present
+                if content.startswith("FINAL_ANSWER:"):
+                    content = content.replace("FINAL_ANSWER:", "").strip()
+                print("\n" + "="*60)
+                print("✅ FINAL ANSWER")
+                print("="*60)
+                print(content)
+                found_answer = True
+                break
+
+        if not found_answer:
+            print("\n⚠️  No response generated")
 
         if changed:
             print(f"\n📝 Files changed this session: {', '.join(changed)}")
