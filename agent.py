@@ -488,6 +488,27 @@ def extract_symbol(path: str, symbol: str) -> str:
         return f"ERROR: {e}"
 
 
+@tool
+def fetch_url(url: str, max_chars: int = 5000) -> str:
+    """Fetch and return the text content of a URL. Use when you need to read
+    a full webpage, documentation page, GitHub file, or any URL.
+    Returns cleaned text content (HTML tags removed).
+    max_chars: maximum characters to return (default 5000)."""
+    try:
+        import re as _re
+        res = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        res.raise_for_status()
+        # Strip HTML tags
+        text = _re.sub(r'<[^>]+>', ' ', res.text)
+        # Collapse whitespace
+        text = _re.sub(r'\s+', ' ', text).strip()
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... (truncated, {len(res.text)} chars total)"
+        return text
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 tools = [
     run_shell, read_file, write_file, list_directory,
     web_search, http_request, git_tool,
@@ -495,6 +516,8 @@ tools = [
     index_codebase, edit_file, preview_diff,
     # Phase 3 — Token-efficient context loading
     extract_symbol,
+    # Phase 3 — Web fetch
+    fetch_url,
 ]
 
 # ============================================================
@@ -514,6 +537,8 @@ AVAILABLE TOOLS:
 - index_codebase : scan entire project — extract all files, classes, functions
 - edit_file      : surgically replace exact text in a file (PREFERRED for edits)
 - preview_diff   : show what a file change would look like before applying it
+- extract_symbol : extract a specific function/class (token-efficient, use instead of read_file when you know the symbol name)
+- fetch_url      : fetch and return the full text content of a URL (use for docs, GitHub files, web pages)
 
 CODING WORKFLOW (follow this order):
 1. index_codebase — understand the project structure first
@@ -550,6 +575,74 @@ else:
 # ============================================================
 
 rag = RAG("rag.store.json")
+
+# ============================================================
+# SESSION CONTINUITY (#7)
+# Persist last N messages between runs so context carries over
+# ============================================================
+
+SESSION_FILE = "session.json"
+
+
+def load_session() -> list:
+    """Load the last 4 messages from session.json as chat_history."""
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        messages = []
+        for m in data.get("messages", [])[-4:]:
+            if m.get("role") == "user":
+                messages.append(HumanMessage(m["content"]))
+            elif m.get("role") == "assistant":
+                messages.append(AIMessage(m["content"]))
+        return messages
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return []
+
+
+def save_session(chat_history: list) -> None:
+    """Save chat_history to session.json, keeping max 20 messages."""
+    messages = []
+    for m in chat_history:
+        if isinstance(m, HumanMessage):
+            messages.append({"role": "user", "content": m.content})
+        elif isinstance(m, AIMessage):
+            messages.append({"role": "assistant", "content": m.content})
+    # Keep only the last 20
+    messages = messages[-20:]
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump({"messages": messages}, f, indent=2)
+
+
+# ============================================================
+# TOKEN TRACKING (#10)
+# ============================================================
+
+class TokenTracker:
+    def __init__(self):
+        self.total_input = 0
+        self.total_output = 0
+
+    def track(self, response) -> None:
+        """Extract token usage from LLM response if available."""
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            self.total_input  += response.usage_metadata.get('input_tokens', 0)
+            self.total_output += response.usage_metadata.get('output_tokens', 0)
+        elif hasattr(response, 'response_metadata'):
+            meta = response.response_metadata
+            self.total_input  += meta.get('prompt_tokens', 0) or meta.get('input_tokens', 0)
+            self.total_output += meta.get('completion_tokens', 0) or meta.get('output_tokens', 0)
+
+    def summary(self) -> str:
+        total = self.total_input + self.total_output
+        if total == 0:
+            return ""
+        # Rough cost estimate (Cloudflare: ~$0.20/M tokens)
+        cost = total / 1_000_000 * 0.20
+        return f"📊 Tokens: {self.total_input} in + {self.total_output} out = {total} total (~${cost:.4f})"
+
+
+token_tracker = TokenTracker()
 
 # Action task patterns — skip RAG injection for these
 # (RAG causes model to answer from memory instead of acting)
@@ -610,7 +703,27 @@ def cf_run_task(task: str, preflight_context: str = "", rag_context: str = "") -
     print("\n🤖 Agent Working... ", end="", flush=True)
 
     for turn in range(max_turns):
-        response = llm.invoke(messages)
+        # Retry LLM call on transient errors
+        response = None
+        for attempt in range(3):
+            try:
+                response = llm.invoke(messages)
+                token_tracker.track(response)
+                break
+            except KeyboardInterrupt:
+                print("\n⚠️  Interrupted")
+                return "(interrupted)", used_tools
+            except Exception as e:
+                if attempt < 2:
+                    import time
+                    wait = 2 ** attempt
+                    print(f"\n⚠️  LLM error (attempt {attempt+1}/3): {str(e)[:80]}")
+                    print(f"   Retrying in {wait}s... ", end="", flush=True)
+                    time.sleep(wait)
+                else:
+                    print(f"\n❌ LLM failed after 3 attempts: {str(e)[:120]}")
+                    return f"Error: {str(e)[:200]}", used_tools
+
         text = response.content.strip()
 
         # Check for tool call
@@ -664,8 +777,13 @@ def cf_run_task(task: str, preflight_context: str = "", rag_context: str = "") -
             final_answer = text
             break
 
-    # Print the final answer to terminal (equivalent of Ollama's streaming print)
-    print(final_answer)
+    # Simulate streaming: print word by word with a tiny delay
+    # (Cloudflare doesn't support true token streaming)
+    import time as _time
+    words = final_answer.split()
+    for i, word in enumerate(words):
+        print(word, end=" " if i < len(words) - 1 else "", flush=True)
+        _time.sleep(0.02)  # 20ms per word — fast enough to not be annoying
     print()  # newline
 
     return final_answer or text, used_tools
@@ -783,21 +901,42 @@ CRITICAL RULES:
     # Stream the response — tokens print as they are generated
     print("\n🤖 Agent Working... ", end="", flush=True)
 
-    for chunk in agent.stream({"messages": messages}):
-        # chunk["agent"] = LLM thinking / final answer tokens
-        if "agent" in chunk:
-            for msg in chunk["agent"].get("messages", []):
-                content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
-                if content:
-                    print(content, end="", flush=True)  # stream token immediately
-                    answer += content
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            for chunk in agent.stream({"messages": messages}):
+                # chunk["agent"] = LLM thinking / final answer tokens
+                if "agent" in chunk:
+                    for msg in chunk["agent"].get("messages", []):
+                        content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
+                        if content:
+                            print(content, end="", flush=True)
+                            answer += content
 
-        # chunk["tools"] = tool execution results
-        if "tools" in chunk:
-            used_tools = True
-            for msg in chunk["tools"].get("messages", []):
-                tool_name = getattr(msg, "name", "tool")
-                print(f"\n⚙️  [{tool_name}] running...\n🤖 Agent Working... ", end="", flush=True)
+                # chunk["tools"] = tool execution results
+                if "tools" in chunk:
+                    used_tools = True
+                    for msg in chunk["tools"].get("messages", []):
+                        tool_name = getattr(msg, "name", "tool")
+                        print(f"\n⚙️  [{tool_name}] running...\n🤖 Agent Working... ", end="", flush=True)
+            break  # success — exit retry loop
+
+        except KeyboardInterrupt:
+            print("\n⚠️  Interrupted by user")
+            answer = "(interrupted)"
+            break
+
+        except Exception as e:
+            error_msg = str(e)
+            if attempt < max_retries:
+                wait = 2 ** attempt  # exponential backoff: 1s, 2s
+                print(f"\n⚠️  Error (attempt {attempt+1}/{max_retries+1}): {error_msg[:80]}")
+                print(f"   Retrying in {wait}s...", end="", flush=True)
+                import time; time.sleep(wait)
+                print(" retrying...")
+            else:
+                print(f"\n❌ Failed after {max_retries+1} attempts: {error_msg[:120]}")
+                answer = f"Sorry, I encountered an error: {error_msg[:200]}"
 
     print()  # newline after streaming finishes
     return answer.strip(), used_tools
@@ -899,7 +1038,7 @@ session = SessionTracker()
 
 def main():
     rag.load()
-    chat_history = []
+    chat_history = load_session()
 
     # ── Phase 3: Load project context on startup ──────────────
     project_context = load_project_context()
@@ -907,6 +1046,8 @@ def main():
     print(f"\n🤖 LangChain Agent (Python)")
     print(f"🧠 LLM       : {llm.model if hasattr(llm, 'model') else type(llm).__name__}")
     print(f"🔍 RAG       : {rag.stats()['total']} vectors loaded")
+    if chat_history:
+        print(f"💬 Session   : {len(chat_history)} messages restored")
     if project_context:
         # Count files detected
         file_count = project_context.count("\n  .")
@@ -934,6 +1075,11 @@ def main():
         if file_match and used_tools:
             session.record(file_match.group(1))
 
+        # Update session
+        chat_history.append(HumanMessage(task))
+        chat_history.append(AIMessage(answer))
+        save_session(chat_history)
+
         if not used_tools:
             rag.add(task, "user", "conversational")
             rag.add(answer, "assistant", "conversational")
@@ -941,6 +1087,11 @@ def main():
             print("💾 Stored in RAG")
         else:
             print("⚡ Not stored (real-time data — always runs fresh)")
+
+        # Token summary
+        summary = token_tracker.summary()
+        if summary:
+            print(summary)
 
         # Phase 3: print session summary
         if not session.is_empty():
@@ -986,6 +1137,7 @@ def main():
         # Update in-memory chat history for multi-turn context
         chat_history.append(HumanMessage(user_input))
         chat_history.append(AIMessage(answer))
+        save_session(chat_history)
 
         if not used_tools:
             rag.add(user_input, "user", "conversational")
@@ -994,6 +1146,11 @@ def main():
             print("💾 Stored in RAG")
         else:
             print("⚡ Real-time data — not stored in RAG")
+
+        # Token summary
+        summary = token_tracker.summary()
+        if summary:
+            print(summary)
 
 
 if __name__ == "__main__":

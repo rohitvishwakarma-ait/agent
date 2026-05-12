@@ -396,62 +396,80 @@ def agent_node(state: AgentState) -> AgentState:
             elif isinstance(m, ToolMessage):
                 cf_messages.append({"role": "user", "content": f"Tool result: {m.content}"})
 
-        response = llm.invoke(cf_messages)
-        text = response.content.strip()
+        # ── Multi-tool loop: keep calling tools until FINAL_ANSWER or max_turns ──
+        tool_map = {t.name: t for t in tools}
+        changed = list(state.get("changed_files", []))
+        accumulated_messages = []
+        max_turns = 6
+        final_text = ""
 
-        # Parse TOOL_CALL from response and convert to proper tool_calls format
-        if "TOOL_CALL:" in text:
-            lines = text.splitlines()
-            tool_name  = ""
-            tool_input = {}
-            for line in lines:
-                if line.startswith("TOOL_CALL:"):
-                    tool_name = line.replace("TOOL_CALL:", "").strip()
-                if line.startswith("INPUT:"):
+        for turn in range(max_turns):
+            response = llm.invoke(cf_messages)
+            text = response.content.strip()
+            accumulated_messages.append(response)
+
+            # Check for FINAL_ANSWER first
+            if "FINAL_ANSWER:" in text:
+                final_text = text.replace("FINAL_ANSWER:", "").strip()
+                break
+
+            # Parse TOOL_CALL from response
+            if "TOOL_CALL:" in text:
+                lines = text.splitlines()
+                tool_name  = ""
+                tool_input = {}
+                for line in lines:
+                    if line.startswith("TOOL_CALL:"):
+                        tool_name = line.replace("TOOL_CALL:", "").strip()
+                    if line.startswith("INPUT:"):
+                        try:
+                            tool_input = json.loads(line.replace("INPUT:", "").strip())
+                        except Exception:
+                            tool_input = {}
+
+                if tool_name in tool_map:
+                    print(f"\n⚙️  [{tool_name}] running...")
                     try:
-                        tool_input = json.loads(line.replace("INPUT:", "").strip())
-                    except Exception:
-                        tool_input = {}
+                        result = tool_map[tool_name].invoke(tool_input)
+                    except Exception as e:
+                        result = f"ERROR[EXCEPTION]: {e}"
 
-            if tool_name in {t.name for t in tools}:
-                # Execute tool directly
-                tool_map = {t.name: t for t in tools}
-                print(f"\n⚙️  [{tool_name}] running...")
-                try:
-                    result = tool_map[tool_name].invoke(tool_input)
-                except Exception as e:
-                    result = f"ERROR[EXCEPTION]: {e}"
+                    # Track changed files
+                    if tool_name in ("edit_file", "write_file"):
+                        f = tool_input.get("path", "")
+                        if f and f not in changed:
+                            changed.append(f)
 
-                # Track changed files
-                changed = list(state.get("changed_files", []))
-                if tool_name in ("edit_file", "write_file"):
-                    f = tool_input.get("path", "")
-                    if f and f not in changed:
-                        changed.append(f)
+                    # Feed result back into conversation and continue loop
+                    cf_messages.append({"role": "assistant", "content": text})
+                    cf_messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Tool result:\n{result}\n\n"
+                            f"If the task is complete, respond with FINAL_ANSWER: <summary>. "
+                            f"If you need to do more, call the next tool."
+                        )
+                    })
+                    accumulated_messages.append(AIMessage(content=f"[tool:{tool_name}] {result[:200]}"))
+                    continue  # next turn
+                else:
+                    # Unknown tool name — treat response as final answer
+                    final_text = text
+                    break
+            else:
+                # No tool call and no FINAL_ANSWER — treat whole response as answer
+                final_text = text
+                break
 
-                # Feed result back and get final answer in same node
-                # (avoids LangGraph self-loop issues with Cloudflare text-mode)
-                cf_messages.append({"role": "assistant", "content": text})
-                cf_messages.append({
-                    "role": "user",
-                    "content": (
-                        f"Tool result:\n{result}\n\n"
-                        f"Now give your FINAL_ANSWER based on this result."
-                    )
-                })
-                final_response = llm.invoke(cf_messages)
-                final_text = final_response.content.strip()
-                if final_text.startswith("FINAL_ANSWER:"):
-                    final_text = final_text.replace("FINAL_ANSWER:", "").strip()
+        # If we exhausted max_turns without a final answer, use last response
+        if not final_text:
+            final_text = text
 
-                final_ai_msg = AIMessage(content=final_text)
-                return {
-                    "messages": [response, AIMessage(content=f"[tool:{tool_name}] {result[:200]}"), final_ai_msg],
-                    "changed_files": changed,
-                }
-
-        # No tool call — final answer
-        return {"messages": [response]}
+        final_ai_msg = AIMessage(content=final_text)
+        return {
+            "messages": accumulated_messages + [final_ai_msg],
+            "changed_files": changed,
+        }
 
     else:
         # ── Standard mode: Ollama / OpenAI with native tool binding ──

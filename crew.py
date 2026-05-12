@@ -36,16 +36,45 @@ load_dotenv()
 from llm_config import get_llm as get_langchain_llm
 
 # CrewAI uses its own LLM wrapper, so we need to convert
-# For now, keep CrewAI's LLM class but make model configurable
-import os
-llm = LLM(
-    model=f"ollama/{os.getenv('OLLAMA_MODEL', 'qwen2:7b')}",
-    base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-    temperature=0,
-    max_tokens=4096,
-)
-# Note: CrewAI doesn't easily support other providers yet
-# Stick with Ollama for crews, or use agent.py/agent_graph.py for other providers
+# Read LLM_PROVIDER from env and configure accordingly
+_provider = os.getenv("LLM_PROVIDER", "ollama").lower()
+
+if _provider == "cloudflare":
+    _account_id  = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+    _gateway     = os.getenv("CLOUDFLARE_GATEWAY_NAME", "my-gateway")
+    _aig_token   = os.getenv("CLOUDFLARE_API_TOKEN", "")
+    llm = LLM(
+        model="openai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        base_url=(
+            f"https://gateway.ai.cloudflare.com/v1/{_account_id}/{_gateway}/workers-ai/v1"
+        ),
+        api_key=_aig_token,
+        extra_headers={"cf-aig-authorization": f"Bearer {_aig_token}"},
+        temperature=0,
+        max_tokens=4096,
+    )
+elif _provider == "openai":
+    llm = LLM(
+        model="openai/gpt-4o-mini",
+        api_key=os.getenv("OPENAI_API_KEY", ""),
+        temperature=0,
+        max_tokens=4096,
+    )
+elif _provider == "groq":
+    llm = LLM(
+        model="groq/llama-3.3-70b-versatile",
+        api_key=os.getenv("GROQ_API_KEY", ""),
+        temperature=0,
+        max_tokens=4096,
+    )
+else:
+    # Default: Ollama
+    llm = LLM(
+        model=f"ollama/{os.getenv('OLLAMA_MODEL', 'qwen2:7b')}",
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        temperature=0,
+        max_tokens=4096,
+    )
 
 # ============================================================
 # TOOL INPUT SCHEMAS

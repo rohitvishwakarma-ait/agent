@@ -53,6 +53,13 @@ class RAG:
             print(f"🔍 RAG loaded {len(self.entries)} vectors ({self.file_path})")
         except FileNotFoundError:
             self.entries = []
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            print(f"⚠️  RAG store corrupted ({e}) — starting fresh")
+            self.entries = []
+
+        # Auto-cleanup if store is large
+        if len(self.entries) > 200:
+            self.cleanup()
 
     # --------------------
     # SAVE — write vector store to disk
@@ -69,14 +76,17 @@ class RAG:
     # EMBED — convert text to a vector using nomic-embed-text
     # --------------------
     def embed(self, text: str) -> list[float]:
-        res = requests.post(
-            self.embed_url,
-            json={"model": self.embed_model, "input": text},
-            timeout=30,
-        )
-        res.raise_for_status()
-        # Response: { "embeddings": [[...768 numbers...]] }
-        return res.json()["embeddings"][0]
+        try:
+            res = requests.post(
+                self.embed_url,
+                json={"model": self.embed_model, "input": text},
+                timeout=30,
+            )
+            res.raise_for_status()
+            return res.json()["embeddings"][0]
+        except Exception as e:
+            # Ollama not available — return None to signal fallback
+            raise ConnectionError(f"Embedding failed (is Ollama running?): {e}")
 
     # --------------------
     # ADD — embed a message and store it
@@ -113,9 +123,14 @@ class RAG:
             if is_question:
                 return  # don't store questions — only store facts
 
-        vector = self.embed(text)
-        random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
+        try:
+            vector = self.embed(text)
+        except ConnectionError as e:
+            # Ollama not available — store with empty vector, keyword search will handle it
+            print(f"⚠️  RAG: {e} — storing without vector (keyword search only)")
+            vector = []
 
+        random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=5))
         self.entries.append(VectorEntry(
             id=f"{int(time.time() * 1000)}-{random_suffix}",
             text=text,
@@ -134,25 +149,68 @@ class RAG:
         if not self.entries:
             return []
 
-        query_vector = self.embed(query)
+        # Try vector search first — fall back to keyword search if Ollama is down
+        try:
+            query_vector = self.embed(query)
+            use_vector = True
+        except ConnectionError:
+            print("⚠️  RAG: Ollama unavailable — using keyword search fallback")
+            use_vector = False
 
-        # Score every stored entry against the query
-        scored = [
-            (entry, cosine_similarity(query_vector, entry.vector))
-            for entry in self.entries
-        ]
+        if use_vector:
+            # Vector search — semantic similarity
+            # Skip entries with empty vectors (stored without Ollama)
+            scoreable = [(e, cosine_similarity(query_vector, e.vector))
+                         for e in self.entries if e.vector]
+            unscorable = [(e, 0.0) for e in self.entries if not e.vector]
+            scored = scoreable + unscorable
+        else:
+            # Keyword search fallback — count word overlap
+            query_words = set(query.lower().split())
+            scored = []
+            for entry in self.entries:
+                entry_words = set(entry.text.lower().split())
+                overlap = len(query_words & entry_words)
+                # Boost score if query words appear in order
+                score = overlap / max(len(query_words), 1)
+                scored.append((entry, score))
 
-        # Sort by score descending, take top K
         scored.sort(key=lambda x: x[1], reverse=True)
         results = scored[:top_k]
 
-        # Log what was retrieved so you can see RAG working
         print(f"\n🔍 RAG retrieved {len(results)} relevant memories:")
         for i, (entry, score) in enumerate(results):
             preview = entry.text[:60]
-            print(f"   {i + 1}. [score: {score:.3f}] \"{preview}...\"")
+            mode = "vec" if use_vector else "kw"
+            print(f"   {i + 1}. [score: {score:.3f}|{mode}] \"{preview}...\"")
 
         return [entry for entry, _ in results]
+
+    # --------------------
+    # CLEANUP — remove stale entries, cap store size
+    # --------------------
+    def cleanup(self, max_age_days: int = 30, max_entries: int = 200, keep_entries: int = 150) -> int:
+        """Remove entries older than max_age_days. If store exceeds max_entries,
+        keep only the newest keep_entries."""
+        import datetime
+        now = datetime.datetime.now()
+        original_count = len(self.entries)
+
+        # Remove entries older than max_age_days
+        cutoff = now - datetime.timedelta(days=max_age_days)
+        self.entries = [
+            e for e in self.entries
+            if datetime.datetime.fromisoformat(e.timestamp.rstrip('Z')) > cutoff
+        ]
+
+        # If still too many, keep newest
+        if len(self.entries) > max_entries:
+            self.entries = sorted(self.entries, key=lambda e: e.timestamp, reverse=True)[:keep_entries]
+
+        removed = original_count - len(self.entries)
+        if removed > 0:
+            print(f"🧹 RAG cleanup: removed {removed} entries ({len(self.entries)} remaining)")
+        return removed
 
     # --------------------
     # CLEAR — wipe everything
