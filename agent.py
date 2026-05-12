@@ -417,11 +417,84 @@ def preview_diff(path: str, new_content: str) -> str:
         return f"ERROR: {e}"
 
 
+# ============================================================
+# PHASE 3 — POLISH TOOLS
+# ============================================================
+
+@tool
+def extract_symbol(path: str, symbol: str) -> str:
+    """Extract a specific function, class, or method from a source file using AST.
+    Much more token-efficient than read_file — loads only what you need.
+    Use instead of read_file when you know the exact function/class name.
+
+    Examples:
+        extract_symbol("rag.py", "cosine_similarity")
+        extract_symbol("agent.py", "run_task")
+        extract_symbol("crew.py", "RunShellTool")
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return f"ERROR: File not found: {path}"
+
+        source = p.read_text(encoding="utf-8")
+        lines  = source.splitlines()
+
+        # Non-Python files — do a text search with context
+        if p.suffix != ".py":
+            symbol_lower = symbol.lower()
+            matches = [(i, l) for i, l in enumerate(lines) if symbol_lower in l.lower()]
+            if not matches:
+                return f"ERROR: '{symbol}' not found in {path}"
+            idx   = matches[0][0]
+            start = max(0, idx - 2)
+            end   = min(len(lines), idx + 20)
+            snippet = "\n".join(f"{start+i+1:4}: {l}" for i, l in enumerate(lines[start:end]))
+            return f"Found '{symbol}' at line {idx+1} in {path}:\n\n{snippet}"
+
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == symbol:
+                    start_line = node.lineno - 1
+                    end_line   = node.end_lineno
+                    # Include decorators
+                    if node.decorator_list:
+                        start_line = node.decorator_list[0].lineno - 1
+
+                    snippet_lines = lines[start_line:end_line]
+                    snippet = "\n".join(
+                        f"{start_line+i+1:4}: {l}" for i, l in enumerate(snippet_lines)
+                    )
+                    token_est = len(" ".join(snippet_lines).split())
+                    full_est  = len(source.split())
+                    return (
+                        f"📍 {symbol} in {path} "
+                        f"(lines {start_line+1}–{end_line}, "
+                        f"~{token_est} tokens vs ~{full_est} for full file)\n\n"
+                        f"{snippet}"
+                    )
+
+        available = ", ".join(
+            n.name for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        return f"ERROR: '{symbol}' not found in {path}.\nAvailable: {available}"
+
+    except SyntaxError as e:
+        return f"ERROR: Syntax error in {path}: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 tools = [
     run_shell, read_file, write_file, list_directory,
     web_search, http_request, git_tool,
     # Phase 1 — Claude Code-like tools
     index_codebase, edit_file, preview_diff,
+    # Phase 3 — Token-efficient context loading
+    extract_symbol,
 ]
 
 # ============================================================
@@ -604,6 +677,7 @@ def cf_run_task(task: str, preflight_context: str = "", rag_context: str = "") -
 def run_task(
     task: str,
     chat_history: list,
+    project_context: str = "",
 ) -> tuple[str, bool]:
     """
     Run one task through the agent with streaming output.
@@ -682,21 +756,23 @@ AVAILABLE TOOLS:
 - index_codebase : scan entire project — extract all files, classes, functions
 - edit_file      : surgically replace exact text in a file (PREFERRED for edits)
 - preview_diff   : show what a file change would look like before applying it
+- extract_symbol : extract a specific function/class (token-efficient, use instead of read_file when you know the symbol name)
 
 CODING WORKFLOW:
-1. read_file      → read the file you need to change
+1. extract_symbol → get just the function/class you need (saves tokens)
+   OR read_file   → if you need the whole file
 2. edit_file      → make surgical changes (ALWAYS prefer over write_file for edits)
 3. write_file     → only for brand new files
 
 CRITICAL RULES:
-- NEVER answer a coding task from memory — always use read_file then edit_file
+- NEVER answer a coding task from memory — always use extract_symbol or read_file first
 - NEVER rewrite an entire file to change a few lines — use edit_file
-- old_str in edit_file must match the file EXACTLY (copy from read_file output)
+- old_str in edit_file must match the file EXACTLY (copy from extract_symbol/read_file output)
 - For CREATE/WRITE/SAVE/GENERATE a new file → use write_file
 - For RUN/CHECK/LIST/FIND on the system → use run_shell or list_directory
 - For SEARCH the web → use web_search
 - Only answer from memory for personal facts — never for action tasks.
-{rag_context}{preflight_context}{coding_instruction}"""
+{rag_context}{preflight_context}{coding_instruction}{project_context}"""
     )
 
     messages = [system_with_rag] + chat_history[-4:] + [HumanMessage(task)]
@@ -731,13 +807,113 @@ CRITICAL RULES:
 # INTERACTIVE LOOP — equivalent of main()
 # ============================================================
 
+# ============================================================
+# PHASE 3 — PROJECT CONTEXT + SESSION TRACKER
+# ============================================================
+
+def load_project_context() -> str:
+    """
+    Auto-load project context on startup:
+    - README.md summary (first 50 lines)
+    - Project file structure (source files only)
+    - Tech stack detected from imports/config files
+
+    Returns a compact context string injected into the system prompt.
+    """
+    context_parts = []
+
+    # 1. README summary
+    for readme in ["README.md", "readme.md", "README.txt"]:
+        p = Path(readme)
+        if p.exists():
+            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[:50]
+            context_parts.append(f"📖 README:\n" + "\n".join(lines))
+            break
+
+    # 2. Project file structure (source files only, skip venv/cache)
+    SKIP_DIRS = {"venv", ".venv", "node_modules", "__pycache__", ".git", "dist", "build"}
+    CODE_EXTS  = {".py", ".js", ".ts", ".go", ".rs", ".java", ".json", ".yaml", ".toml", ".md"}
+    files = []
+    for p in sorted(Path(".").rglob("*")):
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        if p.is_file() and p.suffix in CODE_EXTS:
+            files.append(str(p))
+
+    if files:
+        context_parts.append("📁 Project files:\n" + "\n".join(f"  {f}" for f in files[:30]))
+
+    # 3. Tech stack detection
+    stack = []
+    if Path("requirements.txt").exists():
+        reqs = Path("requirements.txt").read_text(errors="ignore").lower()
+        if "langchain"  in reqs: stack.append("LangChain")
+        if "langgraph"  in reqs: stack.append("LangGraph")
+        if "crewai"     in reqs: stack.append("CrewAI")
+        if "fastapi"    in reqs: stack.append("FastAPI")
+        if "django"     in reqs: stack.append("Django")
+        if "flask"      in reqs: stack.append("Flask")
+        if "pytest"     in reqs: stack.append("pytest")
+        if "openai"     in reqs: stack.append("OpenAI")
+        if "anthropic"  in reqs: stack.append("Anthropic")
+    if Path("package.json").exists():
+        stack.append("Node.js")
+    if stack:
+        context_parts.append(f"🔧 Stack: {', '.join(stack)}")
+
+    if not context_parts:
+        return ""
+
+    return "\n\n--- PROJECT CONTEXT ---\n" + "\n\n".join(context_parts) + "\n--- END PROJECT CONTEXT ---\n"
+
+
+class SessionTracker:
+    """
+    Phase 3: Track all file changes made during the current session.
+    Shows a summary at the end so you know exactly what was touched.
+    """
+    def __init__(self):
+        self.changes: dict[str, int] = {}   # file → edit count
+        self.start_time = datetime.now()
+
+    def record(self, path: str) -> None:
+        self.changes[path] = self.changes.get(path, 0) + 1
+
+    def summary(self) -> str:
+        if not self.changes:
+            return ""
+        duration = (datetime.now() - self.start_time).seconds
+        lines = [f"\n📝 Session Summary ({duration}s):"]
+        for path, count in sorted(self.changes.items()):
+            lines.append(f"   {path:<30} — {count} edit{'s' if count > 1 else ''}")
+        lines.append("\n   Run 'git diff' to review all changes")
+        return "\n".join(lines)
+
+    def is_empty(self) -> bool:
+        return len(self.changes) == 0
+
+
+# Global session tracker
+session = SessionTracker()
+
+
 def main():
     rag.load()
     chat_history = []
 
+    # ── Phase 3: Load project context on startup ──────────────
+    project_context = load_project_context()
+
     print(f"\n🤖 LangChain Agent (Python)")
     print(f"🧠 LLM       : {llm.model if hasattr(llm, 'model') else type(llm).__name__}")
     print(f"🔍 RAG       : {rag.stats()['total']} vectors loaded")
+    if project_context:
+        # Count files detected
+        file_count = project_context.count("\n  .")
+        stack_line = next((l for l in project_context.splitlines() if "Stack:" in l), "")
+        print(f"📁 Project   : {file_count} files indexed")
+        if stack_line:
+            print(f"🔧 {stack_line.strip()}")
     print(f"\nCommands: /clear  /exit\n")
 
     # Single-shot mode: task passed as CLI argument
@@ -751,7 +927,12 @@ def main():
     if args:
         task = args[0]
         print(f"📋 Task: {task}")
-        answer, used_tools = run_task(task, chat_history)
+        answer, used_tools = run_task(task, chat_history, project_context)
+
+        # Phase 3: track session changes
+        file_match = re.search(r"([\w./\\-]+\.(?:py|js|ts|go|rs|java|json|yaml|toml))", task)
+        if file_match and used_tools:
+            session.record(file_match.group(1))
 
         if not used_tools:
             rag.add(task, "user", "conversational")
@@ -760,6 +941,10 @@ def main():
             print("💾 Stored in RAG")
         else:
             print("⚡ Not stored (real-time data — always runs fresh)")
+
+        # Phase 3: print session summary
+        if not session.is_empty():
+            print(session.summary())
         return
 
     # Interactive mode
@@ -767,6 +952,8 @@ def main():
         try:
             user_input = input("\nYou: ").strip()
         except (EOFError, KeyboardInterrupt):
+            if not session.is_empty():
+                print(session.summary())
             print("\n👋 Goodbye!\n")
             break
 
@@ -774,6 +961,8 @@ def main():
             continue
 
         if user_input in ("/exit", "/quit"):
+            if not session.is_empty():
+                print(session.summary())
             print("\n👋 Goodbye!\n")
             break
 
@@ -783,7 +972,16 @@ def main():
             print("🗑️  Cleared.")
             continue
 
-        answer, used_tools = run_task(user_input, chat_history)
+        if user_input == "/session":
+            print(session.summary() or "No files changed this session.")
+            continue
+
+        answer, used_tools = run_task(user_input, chat_history, project_context)
+
+        # Phase 3: track session changes
+        file_match = re.search(r"([\w./\\-]+\.(?:py|js|ts|go|rs|java|json|yaml|toml))", user_input)
+        if file_match and used_tools:
+            session.record(file_match.group(1))
 
         # Update in-memory chat history for multi-turn context
         chat_history.append(HumanMessage(user_input))
