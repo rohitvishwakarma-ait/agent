@@ -181,7 +181,7 @@ class RAG:
 # explicit here so the math is visible — same as the TS version
 # ============================================================
 
-def cosine_similarity(a: list[float], b: list[float]) -> float:
+def cosine_similarity(a: list[float], b: list[float]) -> float:  # This function calculates the cosine similarity between two vectors
     # Dot product: how much A and B point in the same direction
     dot = sum(x * y for x, y in zip(a, b))
 
