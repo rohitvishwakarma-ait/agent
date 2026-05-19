@@ -164,12 +164,13 @@ def run_tests(test_path: str = ".", pattern: str = "") -> str:
 
 
 @tool
-def git_write(action: str, message: str = "", files: str = ".", branch: str = "") -> str:
+def git_write(action: str, message: str = "", files: str = ".", branch: str = "", remote: str = "origin") -> str:
     """Perform git write operations. REQUIRES APPROVAL.
-    action: 'commit' | 'branch' | 'stage'
+    action: 'stage' | 'commit' | 'push' | 'branch'
     message: commit message (for commit action)
     files: files to stage (default: all changed files)
-    branch: branch name (for branch action)"""
+    branch: branch name (for branch action)
+    remote: remote name for push (default: origin)"""
     try:
         if action == "branch":
             if not branch:
@@ -193,8 +194,24 @@ def git_write(action: str, message: str = "", files: str = ".", branch: str = ""
                 shell=True, capture_output=True, text=True
             )
             return result.stdout or result.stderr
+        elif action == "push":
+            # Get current branch if not specified
+            if not branch:
+                br = subprocess.run(
+                    "git rev-parse --abbrev-ref HEAD",
+                    shell=True, capture_output=True, text=True
+                )
+                branch = br.stdout.strip() or "main"
+            result = subprocess.run(
+                f"git push {remote} {branch}",
+                shell=True, capture_output=True, text=True
+            )
+            output = result.stdout or result.stderr
+            if result.returncode == 0:
+                return f"✅ Pushed to {remote}/{branch}\n{output}"
+            return f"ERROR: push failed\n{output}"
         else:
-            return f"ERROR: unknown action '{action}'. Use: commit | branch | stage"
+            return f"ERROR: unknown action '{action}'. Use: stage | commit | push | branch"
     except Exception as e:
         return f"ERROR[EXCEPTION]: {e}"
 
@@ -383,8 +400,20 @@ def agent_node(state: AgentState) -> AgentState:
             f"To use a tool respond with:\n"
             f"TOOL_CALL: tool_name\n"
             f"INPUT: {{\"param\": \"value\"}}\n\n"
-            f"When done respond with:\n"
-            f"FINAL_ANSWER: <your answer>\n"
+            f"CRITICAL RULES:\n"
+            f"  - CREATE a new file → use write_file (never run_shell with echo/touch)\n"
+            f"  - EDIT a file → read_file first, then edit_file\n"
+            f"  - GIT stage → git_write action=stage files=<path>\n"
+            f"  - GIT commit → git_write action=commit message=<msg>\n"
+            f"  - GIT push → git_write action=push\n"
+            f"  - Always complete file operations BEFORE git operations\n\n"
+            f"WORKFLOW for 'create file and commit':\n"
+            f"  1. write_file (create the file)\n"
+            f"  2. git_write action=stage files=<filename>\n"
+            f"  3. git_write action=commit message=<msg>\n"
+            f"  4. git_write action=push (if requested)\n"
+            f"  5. FINAL_ANSWER: <summary>\n\n"
+            f"When done respond with FINAL_ANSWER: <your answer>\n"
             f"{plan_context}"
         )
         cf_messages = [{"role": "system", "content": system_content}]
